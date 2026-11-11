@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
-"""Meeting transcript -> summary, priorities, calendar events (DeepSeek).
+"""Meeting transcript -> summary, priorities, events, communication insights.
 
 Adapts the strict-JSON parse pattern from Allen's calendar intake: ONE call,
 temperature 0, JSON-only reply, validated before anything is written.
 Relative dates resolve against the meeting date, never against parse time.
+
+v2: tags the meeting with an active project (projects.json) and analyzes
+communication effectiveness — outcome, objections, and concrete persuasion
+recommendations for the next conversation when the goal was not achieved.
 
 Setup: DEEPSEEK_API_KEY in .env (platform.deepseek.com).
 """
@@ -24,14 +28,32 @@ load_dotenv(Path(__file__).resolve().parent / ".env")
 DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
 MAX_EVENT_DAYS = 365
+OUTCOMES = ("achieved", "partial", "not_achieved", "unclear")
 
 
-def _validate(data: dict, meeting_day: str) -> dict:
+def _clean_str_list(raw, cap: int = 6, maxlen: int = 400) -> list[str]:
+    if not isinstance(raw, list):
+        return []  # a bare string would iterate char-by-char — reject, don't coerce
+    out = []
+    for x in raw:
+        s = str(x).strip()
+        if s:
+            out.append(s[:maxlen])
+        if len(out) >= cap:
+            break
+    return out
+
+
+def _validate(data: dict, meeting_day: str, project_keys: set[str]) -> dict:
     """Coerce the model's JSON into the known shape; drop unusable rows."""
     if not isinstance(data, dict):
         raise RuntimeError("parse response is not a JSON object")
 
     summary = str(data.get("summary") or "").strip()
+
+    project = data.get("project")
+    if not (isinstance(project, str) and project in project_keys):
+        project = None
 
     priorities = []
     for p in data.get("priorities") or []:
@@ -74,31 +96,70 @@ def _validate(data: dict, meeting_day: str) -> dict:
         events.append({"date": d, "subject": subject[:60],
                        "notes": str(e.get("notes") or "").strip()[:80]})
 
-    return {"summary": summary, "priorities": priorities, "events": events}
+    ins_raw = data.get("insights")
+    ins_raw = ins_raw if isinstance(ins_raw, dict) else {}
+    outcome = str(ins_raw.get("outcome") or "unclear").lower()
+    if outcome not in OUTCOMES:
+        outcome = "unclear"
+    insights = {
+        "outcome": outcome,
+        "objections": _clean_str_list(ins_raw.get("objections")),
+        "recommendations": _clean_str_list(ins_raw.get("recommendations")),
+    }
+
+    return {"project": project, "summary": summary, "priorities": priorities,
+            "events": events, "insights": insights}
 
 
-def summarize(transcript: str, meeting_day: str | None = None) -> dict:
-    """One DeepSeek call -> {summary, priorities[], events[]}, validated."""
+def summarize(transcript: str, meeting_day: str | None = None,
+              projects: list[dict] | None = None,
+              project_key: str | None = None) -> dict:
+    """One DeepSeek call -> validated {project, summary, priorities, events,
+    insights}. projects: [{key, name, context}]; project_key forces the tag."""
     key = os.getenv("DEEPSEEK_API_KEY")
     if not key:
         raise RuntimeError(
             "DEEPSEEK_API_KEY not set — copy .env.example to .env and paste your key"
         )
     meeting_day = meeting_day or date.today().isoformat()
+    projects = projects or []
+    project_keys = {p["key"] for p in projects}
+    if projects:
+        proj_lines = "\n".join(f"- {p['key']}: {p['name']} — {p['context']}"
+                               for p in projects)
+        project_rule = (
+            "The reader's active projects:\n" + proj_lines + "\n"
+            'Tag "project" with the best-matching project key, or null if none fit. '
+        )
+    else:
+        project_rule = 'Set "project" to null. '
     system = (
-        "You extract action items and calendar events from a meeting transcript. "
+        "You extract action items, calendar events, and communication insights "
+        "from a meeting transcript. "
         f"The meeting date (TODAY for relative dates) is {meeting_day}. "
-        "Return ONLY a strict JSON object with three keys: "
+        + project_rule +
+        "Return ONLY a strict JSON object with these keys: "
+        "\"project\" (project key or null), "
         "\"summary\" (3-5 sentences covering what was discussed and decided), "
         "\"priorities\" (array of objects: \"task\" <=100 chars, \"owner\" "
         "(person's name or null), \"due\" (\"YYYY-MM-DD\" or null), \"priority\" "
         "(\"high\"|\"medium\"|\"low\")), "
         "\"events\" (array of objects: \"date\" \"YYYY-MM-DD\", \"subject\" <=60 "
-        "chars, \"notes\" <=80 chars). "
+        "chars, \"notes\" <=80 chars), "
+        "\"insights\" (object: \"outcome\" (\"achieved\"|\"partial\"|\"not_achieved\""
+        "|\"unclear\" — was the meeting's goal reached?), \"objections\" (array of "
+        "concerns or resistance raised, close to how they were said), "
+        "\"recommendations\" (array of concrete advice for the NEXT conversation "
+        "to improve communication and persuasion — phrasing to use, evidence to "
+        "bring, questions to ask, follow-up timing — especially when the outcome "
+        "was not achieved, e.g. a prospect decided to move on; tailor to the "
+        "project context when known)). "
         "Resolve relative dates ('next Friday', 'the 20th') against the meeting "
         "date; a bare month-name day means the NEXT future occurrence. "
         "Only include events with a clear date; undated tasks get due=null. "
-        "Rank by what the speakers emphasized as urgent or blocking. "
+        "Rank priorities by what the speakers emphasized as urgent or blocking. "
+        "For purely informational meetings use outcome=\"unclear\" and keep "
+        "recommendations minimal. "
         "No markdown fences, no commentary."
     )
     payload = {
@@ -122,4 +183,7 @@ def summarize(transcript: str, meeting_day: str | None = None) -> dict:
     start, end = content.find("{"), content.rfind("}")
     if start == -1 or end <= start:
         raise RuntimeError("parse response contained no JSON object")
-    return _validate(json.loads(content[start:end + 1]), meeting_day)
+    data = _validate(json.loads(content[start:end + 1]), meeting_day, project_keys)
+    if project_key:
+        data["project"] = project_key
+    return data

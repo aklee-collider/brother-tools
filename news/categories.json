@@ -1,0 +1,48 @@
+[
+  {
+    "key": "ca_higher_ed",
+    "name": "Canadian Higher Education Policy",
+    "focus": "Major federal and provincial announcements related to higher education in Canada: immigration and study permits, ministry of education decisions, public discourse on private colleges, funding and research policy.",
+    "feeds": [
+      {"name": "University Affairs", "url": "https://www.universityaffairs.ca/feed/", "max": 8},
+      {"name": "Inside Higher Ed", "url": "https://www.insidehighered.com/rss.xml", "max": 8},
+      {"name": "CIC News", "url": "https://www.cicnews.com/feed", "max": 8},
+      {"name": "CBC Canada", "url": "https://www.cbc.ca/webfeed/rss/rss-canada", "max": 8},
+      {"name": "Google News: higher education Canada", "url": "https://news.google.com/rss/search?q=%22higher%20education%22%20Canada&hl=en-CA&gl=CA&ceid=CA:en", "max": 8},
+      {"name": "Google News: international students CA", "url": "https://news.google.com/rss/search?q=%22international%20students%22%20OR%20%22study%20permit%22%20Canada&hl=en-CA&gl=CA&ceid=CA:en", "max": 8}
+    ]
+  },
+  {
+    "key": "world_canada",
+    "name": "World & Canada Events",
+    "focus": "Notable world and Canadian events: major developments, breaking news, significant policy, economic or social events.",
+    "feeds": [
+      {"name": "BBC World", "url": "http://feeds.bbci.co.uk/news/world/rss.xml", "max": 8},
+      {"name": "CBC World", "url": "https://www.cbc.ca/webfeed/rss/rss-world", "max": 8},
+      {"name": "The Guardian — World", "url": "https://www.theguardian.com/world/rss", "max": 8},
+      {"name": "Global News", "url": "https://globalnews.ca/feed/", "max": 8}
+    ]
+  },
+  {
+    "key": "tech_talent",
+    "name": "Professional Development & Tech Talent (North America)",
+    "focus": "Professional development and tech talent in North America: tech industry shifts, hiring and layoffs, skills and career development, workplace and management trends.",
+    "feeds": [
+      {"name": "Hacker News", "url": "https://news.ycombinator.com/rss", "max": 8},
+      {"name": "TechCrunch", "url": "https://techcrunch.com/feed/", "max": 8},
+      {"name": "The Verge", "url": "https://www.theverge.com/rss/index.xml", "max": 8},
+      {"name": "BetaKit", "url": "https://betakit.com/feed/", "max": 8},
+      {"name": "Harvard Business Review", "url": "http://feeds.harvardbusiness.org/harvardbusiness/", "max": 8}
+    ]
+  },
+  {
+    "key": "dental",
+    "name": "Dental Industry → Canadian Dental Software",
+    "focus": "Advancements in the dental industry that impact dental specialist software in Canada: practice management technology, dental AI and imaging, industry consolidation, regulation affecting dental practices.",
+    "feeds": [
+      {"name": "Google News: dental Canada", "url": "https://news.google.com/rss/search?q=dental%20industry%20OR%20dental%20software%20OR%20dentistry%20Canada&hl=en-CA&gl=CA&ceid=CA:en", "max": 8},
+      {"name": "Google News: dental software / AI", "url": "https://news.google.com/rss/search?q=%22dental%20software%22%20OR%20%22dental%20AI%22%20OR%20%22dentistry%20technology%22&hl=en-CA&gl=CA&ceid=CA:en", "max": 8},
+      {"name": "Today's RDH", "url": "https://www.todaysrdh.com/feed/", "max": 8}
+    ]
+  }
+]
