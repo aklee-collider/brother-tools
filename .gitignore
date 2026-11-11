@@ -1,0 +1,11 @@
+# Secrets — never commit real keys
+.env
+
+# Python
+__pycache__/
+*.pyc
+
+# Generated output
+transcriber/output/
+rss/headlines.json
+rss/index.html

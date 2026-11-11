@@ -1,0 +1,7 @@
+[
+  {"name": "Hacker News", "url": "https://news.ycombinator.com/rss", "max": 10},
+  {"name": "The Guardian — World", "url": "https://www.theguardian.com/world/rss", "max": 10},
+  {"name": "Rolling Stone", "url": "https://www.rollingstone.com/feed/", "max": 10},
+  {"name": "The Atlantic", "url": "https://www.theatlantic.com/feed/all/", "max": 10},
+  {"name": "Forbes — Innovation", "url": "https://www.forbes.com/innovation/feed/", "max": 10}
+]
