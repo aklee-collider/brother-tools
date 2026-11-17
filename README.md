@@ -5,6 +5,7 @@ Two small tools, built to be low-maintenance:
 | Tool | What it does | Start here |
 |---|---|---|
 | **[transcriber](transcriber/)** | phone recording → transcript, outstanding tasks, calendar events (.ics), communication insights — per project (Westcliff, 2Nimbus, …) | `transcriber/README.md` |
+| **[calendar](calendar/)** | **My Work Calendar** — one page with every task and event from all processed meetings + your own additions | `calendar/open.cmd` (after setup) |
 | **[news](news/)** | daily briefing: Canadian higher-ed policy · world & Canada events · NA tech talent & professional development · dental industry → Canadian dental software | `news/README.md` |
 
 ## Quick start
@@ -22,6 +23,10 @@ Two small tools, built to be low-maintenance:
    gap explained in plain language.
 
 ## Background automation (optional, one double-click each)
+
+- `calendar\open.cmd` — rebuilds **My Work Calendar** and opens it. After
+  each processed meeting, its tasks and events appear there automatically;
+  `calendar\add.cmd` adds your own.
 
 - `news\install_daily.cmd` — daily 07:30 briefing; missed runs (PC was off)
   fire when the PC wakes; output lands in `news\output\news_log.txt`.
