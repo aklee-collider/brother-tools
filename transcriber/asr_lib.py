@@ -16,6 +16,7 @@ that is not a short wav).
 
 from __future__ import annotations
 
+import math
 import os
 import shutil
 import subprocess
@@ -83,6 +84,56 @@ def _log_cost(duration: float, segments: int, cost: float, lane: str) -> None:
         pass
 
 
+def _wav_duration(path: Path) -> float | None:
+    """Duration of a produced 16k mono wav segment, via the wave module."""
+    try:
+        import wave
+        with wave.open(str(path), "rb") as w:
+            return w.getnframes() / float(w.getframerate() or 1)
+    except Exception:
+        return None
+
+
+def _verify_conversion(segs: list[Path], source_duration: float) -> None:
+    """Fail loudly if the ffmpeg conversion came out incomplete.
+
+    A crashed/failed conversion used to leave a partial set of segments that
+    was then transcribed as if complete — a silently truncated transcript.
+    Gate: every segment must exist, be a decodable wav, and the measured
+    total duration must cover the source (5% + 1s tolerance for the audio
+    lost at each cut boundary).
+    """
+    if not segs:
+        raise RuntimeError(
+            "ffmpeg conversion produced no audio segments — refusing to "
+            "transcribe (results would be silently incomplete)"
+        )
+    total = 0.0
+    for seg in segs:
+        if not seg.exists() or seg.stat().st_size <= 44:  # 44 bytes = bare wav header
+            raise RuntimeError(f"conversion segment missing or empty: {seg.name}")
+        d = _wav_duration(seg)
+        if d is None:
+            raise RuntimeError(f"conversion segment is not a readable wav: {seg.name}")
+        total += d
+    if source_duration > 0:
+        tolerance = max(1.0, 0.05 * source_duration)
+        if total < source_duration - tolerance:
+            raise RuntimeError(
+                f"incomplete conversion: segments cover {total:.0f}s of a "
+                f"{source_duration:.0f}s recording ({len(segs)} segment(s)) — "
+                "transcription would be silently truncated; re-run this file"
+            )
+
+
+def _run_ffmpeg(cmd: list[str], timeout: int, what: str) -> None:
+    """Run ffmpeg and fail loudly on a non-zero exit (stderr tail included)."""
+    proc = subprocess.run(cmd, capture_output=True, timeout=timeout)
+    if proc.returncode != 0:
+        tail = (proc.stderr or b"")[-300:].decode("utf-8", "replace").strip()
+        raise RuntimeError(f"ffmpeg failed during {what} (exit {proc.returncode}): {tail}")
+
+
 def asr_segment(seg_path: Path, model: str, api_key: str) -> str:
     """Push one <= 30 s segment through the transcriptions endpoint."""
     import requests
@@ -140,22 +191,36 @@ def transcribe(path: str | Path, model: str = ASR_MODEL_DEFAULT,
                 if 0 < duration <= ASR_CHUNK_SECONDS:
                     # short non-wav: single re-encode for codec safety
                     seg = tdir / "seg_000.wav"
-                    subprocess.run(
+                    _run_ffmpeg(
                         [ff, "-y", "-i", str(file_path), "-ac", "1", "-ar", "16000", str(seg)],
-                        capture_output=True, timeout=120,
+                        timeout=120, what="single re-encode",
                     )
                     seg_paths = [seg]
+                    _verify_conversion(seg_paths, duration)
                 else:
-                    subprocess.run(
+                    _run_ffmpeg(
                         [ff, "-y", "-i", str(file_path), "-ac", "1", "-ar", "16000",
                          "-f", "segment", "-segment_time", str(ASR_CHUNK_SECONDS),
                          str(tdir / "seg_%03d.wav")],
-                        capture_output=True, timeout=600,
+                        timeout=600, what="segmented re-encode",
                     )
                     seg_paths = sorted(tdir.glob("seg_*.wav"))
+                    if duration > 0:
+                        expected = math.ceil(duration / ASR_CHUNK_SECONDS)
+                        if len(seg_paths) < max(1, expected - 1):
+                            # expected-1: the last segment can be folded into the
+                            # previous one when the tail is under a second
+                            raise RuntimeError(
+                                f"incomplete conversion: {len(seg_paths)} segment(s) "
+                                f"for a {duration:.0f}s recording (~{expected} expected)"
+                            )
+                    _verify_conversion(seg_paths, duration)
             except subprocess.TimeoutExpired:
                 shutil.rmtree(tdir, ignore_errors=True)
                 raise RuntimeError("ffmpeg re-encode timed out")
+            except RuntimeError:
+                shutil.rmtree(tdir, ignore_errors=True)
+                raise
         # no ffmpeg and not short-wav: send as-is; the API's own 30 s cap
         # produces a clean error if the audio is too long.
 
@@ -170,11 +235,15 @@ def transcribe(path: str | Path, model: str = ASR_MODEL_DEFAULT,
         )
 
     texts: list[str] = []
+    empty = 0
     try:
         for i, seg in enumerate(seg_paths):
             if i:
                 time.sleep(0.2)
-            texts.append(asr_segment(seg, model, key))
+            t = asr_segment(seg, model, key)
+            if not t:
+                empty += 1  # a segment that billed but returned nothing — surface it
+            texts.append(t)
     finally:
         for seg in seg_paths:
             if seg != file_path:
@@ -190,6 +259,7 @@ def transcribe(path: str | Path, model: str = ASR_MODEL_DEFAULT,
         "transcript": transcript,
         "duration_s": round(duration, 1),
         "segments": len(seg_paths),
+        "segments_empty": empty,
         "cost_yuan_est": round(cost, 4),
         "model": model,
     }

@@ -5,9 +5,15 @@ Usage:
     python transcribe.py meeting.m4a
     python transcribe.py meeting.m4a --project westcliff --date 2026-11-10
     python transcribe.py meeting.m4a --no-summary --open
+    python transcribe.py --resume output/meeting_20261117-120000 --date 2026-11-15
+
+--resume re-runs ONLY the summary step from the saved transcript: use it when
+the summary step failed (no re-transcription, no ASR cost again) or when the
+assumed meeting date was wrong (pass --date to correct it).
 
 Outputs (under output/<name>_<timestamp>/):
     transcript.txt   full transcript (always written, even if later steps fail)
+    asr_meta.json    transcription facts (duration, segments, cost, date) for --resume
     summary.md       overview + priorities + events + communication insights
     tasks.md         checkbox priority list (outstanding tasks)
     events.ics       calendar events — import into Google/Apple/Outlook
@@ -110,7 +116,8 @@ def write_tasks(priorities: list[dict], path: Path, title: str) -> None:
 
 
 def write_summary(data: dict, asr: dict, path: Path, title: str,
-                  meeting_day: str, projects: list[dict] | None = None) -> None:
+                  meeting_day: str, projects: list[dict] | None = None,
+                  date_note: str = "") -> None:
     proj_name = None
     if data.get("project"):
         for p in projects or []:
@@ -120,7 +127,9 @@ def write_summary(data: dict, asr: dict, path: Path, title: str,
         proj_name = proj_name or data["project"]
     lines = [
         f"# Meeting summary — {title}",
-        f"_Meeting date: {meeting_day} · audio {asr['duration_s']:.0f}s · "
+        f"_Meeting date: {meeting_day}"
+        + (f" — {date_note}" if date_note else "")
+        + f" · audio {asr['duration_s']:.0f}s · "
         f"ASR cost ~¥{asr['cost_yuan_est']:.2f}"
         + (f" · project: {proj_name}_" if proj_name else "_"),
         "",
@@ -164,45 +173,106 @@ def write_summary(data: dict, asr: dict, path: Path, title: str,
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Transcribe a meeting recording and extract priorities, calendar events, and communication insights.")
-    ap.add_argument("audio", help="audio file (wav/mp3/m4a/ogg/opus)")
+    ap.add_argument("audio", nargs="?", help="audio file (wav/mp3/m4a/ogg/opus); omit when using --resume")
+    ap.add_argument("--resume", metavar="OUT_DIR",
+                    help="re-run the summary step from a saved transcript (no ASR cost); "
+                         "combine with --date to correct the meeting date")
     ap.add_argument("--date", help="meeting date YYYY-MM-DD (default: today) — anchors relative dates")
+    ap.add_argument("--date-assumed", action="store_true",
+                    help="(used by watch.cmd) label the date as assumed from the recording file")
     ap.add_argument("--project", help="project key from projects.json (e.g. westcliff, 2nimbus); default: inferred from the transcript")
     ap.add_argument("--no-summary", action="store_true", help="transcript only, skip the DeepSeek step")
     ap.add_argument("--out", help="output folder (default: output/<name>_<timestamp>)")
     ap.add_argument("--open", action="store_true", help="open the output folder when done")
     args = ap.parse_args()
 
-    audio = Path(args.audio)
-    if not audio.exists():
-        print(f"ERROR: file not found: {audio}", file=sys.stderr)
-        return 1
-    meeting_day = args.date or date.today().isoformat()
-    try:
-        date.fromisoformat(meeting_day)
-    except ValueError:
-        print(f"ERROR: --date must be YYYY-MM-DD, got {meeting_day!r}", file=sys.stderr)
-        return 1
     projects = load_projects()
     if args.project and args.project not in {p["key"] for p in projects}:
         keys = ", ".join(p["key"] for p in projects) or "(none defined)"
         print(f"ERROR: unknown project {args.project!r} — known keys: {keys}", file=sys.stderr)
         return 1
+    if args.date:
+        try:
+            date.fromisoformat(args.date)
+        except ValueError:
+            print(f"ERROR: --date must be YYYY-MM-DD, got {args.date!r}", file=sys.stderr)
+            return 1
 
-    out_dir = Path(args.out) if args.out else HERE / "output" / f"{audio.stem}_{datetime.now():%Y%m%d-%H%M%S}"
-    out_dir.mkdir(parents=True, exist_ok=True)
+    asr: dict
+    title: str
+    if args.resume:
+        if args.audio:
+            print("ERROR: --resume works from the saved transcript — do not pass an audio file too.",
+                  file=sys.stderr)
+            return 1
+        out_dir = Path(args.resume)
+        tpath = out_dir / "transcript.txt"
+        mpath = out_dir / "asr_meta.json"
+        if not tpath.exists() or not mpath.exists():
+            print(f"ERROR: {out_dir} has no transcript.txt/asr_meta.json to resume from.",
+                  file=sys.stderr)
+            return 1
+        meta = json.loads(mpath.read_text(encoding="utf-8"))
+        transcript = tpath.read_text(encoding="utf-8")
+        asr = {
+            "transcript": transcript,
+            "duration_s": meta.get("duration_s", 0.0),
+            "segments": meta.get("segments", 0),
+            "segments_empty": meta.get("segments_empty", 0),
+            "cost_yuan_est": meta.get("cost_yuan_est", 0.0),
+            "model": meta.get("model", ""),
+        }
+        title = meta.get("title") or out_dir.name
+        meeting_day = args.date or meta.get("meeting_day") or date.today().isoformat()
+        date_note = "corrected date" if args.date else meta.get("date_note", "")
+        print(f"Resuming from saved transcript in {out_dir.name} (no transcription cost).")
+    else:
+        if not args.audio:
+            ap.error("an audio file is required (or use --resume OUT_DIR)")
+        audio = Path(args.audio)
+        if not audio.exists():
+            print(f"ERROR: file not found: {audio}", file=sys.stderr)
+            return 1
+        meeting_day = args.date or date.today().isoformat()
+        if args.date_assumed:
+            date_note = ("assumed from the recording file — wrong? fix with: "
+                         "python transcribe.py --resume <this folder> --date YYYY-MM-DD")
+        elif args.date:
+            date_note = ""
+        else:
+            date_note = ("today — if the meeting was earlier, re-run with --date YYYY-MM-DD")
+        title = audio.stem
 
-    print(f"Transcribing {audio.name} ...")
-    try:
-        asr = asr_lib.transcribe(audio, lane="meeting")
-    except Exception as exc:
-        print(f"ERROR (transcription): {exc}", file=sys.stderr)
-        return 1
-    (out_dir / "transcript.txt").write_text(asr["transcript"], encoding="utf-8")
-    print(f"  {asr['duration_s']:.0f}s audio, {asr['segments']} segment(s), "
-          f"~¥{asr['cost_yuan_est']:.2f} -> transcript.txt")
-    if not asr["transcript"].strip():
-        print("WARNING: transcript is empty — nothing to summarize.", file=sys.stderr)
-        return 1
+        out_dir = Path(args.out) if args.out else HERE / "output" / f"{audio.stem}_{datetime.now():%Y%m%d-%H%M%S}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        print(f"Transcribing {audio.name} ...")
+        try:
+            asr = asr_lib.transcribe(audio, lane="meeting")
+        except Exception as exc:
+            print(f"ERROR (transcription): {exc}", file=sys.stderr)
+            return 1
+        (out_dir / "transcript.txt").write_text(asr["transcript"], encoding="utf-8")
+        (out_dir / "asr_meta.json").write_text(json.dumps({
+            "title": title,
+            "audio": audio.name,
+            "meeting_day": meeting_day,
+            "date_note": date_note,
+            "duration_s": asr["duration_s"],
+            "segments": asr["segments"],
+            "segments_empty": asr.get("segments_empty", 0),
+            "cost_yuan_est": asr["cost_yuan_est"],
+            "model": asr["model"],
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"  {asr['duration_s']:.0f}s audio, {asr['segments']} segment(s), "
+              f"~¥{asr['cost_yuan_est']:.2f} -> transcript.txt")
+        if asr.get("segments_empty"):
+            print(f"WARNING: {asr['segments_empty']} of {asr['segments']} audio segments "
+                  "returned no text — the transcript may be missing parts of the meeting.",
+                  file=sys.stderr)
+        if not asr["transcript"].strip():
+            print("WARNING: transcript is empty — nothing to summarize.", file=sys.stderr)
+            return 1
 
     if not args.no_summary:
         print("Extracting priorities, events, and insights ...")
@@ -211,10 +281,12 @@ def main() -> int:
                                        projects=projects, project_key=args.project)
         except Exception as exc:
             print(f"ERROR (summary): {exc}", file=sys.stderr)
-            print("Transcript is saved; fix the key/network and re-run with the same file.", file=sys.stderr)
+            print("Transcript is saved — no transcription cost to repeat. Once the "
+                  "key/network is fixed, resume with:\n"
+                  f"  python transcribe.py --resume {out_dir}", file=sys.stderr)
             return 1
-        title = audio.stem
-        write_summary(data, asr, out_dir / "summary.md", title, meeting_day, projects)
+        write_summary(data, asr, out_dir / "summary.md", title, meeting_day, projects,
+                      date_note=date_note)
         write_tasks(data["priorities"], out_dir / "tasks.md", title)
         write_ics(data["events"], out_dir / "events.ics")
         print(f"  project: {data.get('project') or '(none)'} | "

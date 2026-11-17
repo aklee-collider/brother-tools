@@ -133,6 +133,27 @@ def parse_feed(xml_bytes: bytes, max_items: int, is_google_news: bool) -> list[d
     return items
 
 
+def _link_identity(url: str) -> str:
+    """Dedupe identity for a link: the full URL minus fragment, trailing
+    path slash, and URL case. Query params are KEPT — distinct articles
+    often differ only there, and stripping them once collapsed separate
+    stories into one (the survivor's link won, the other was hidden)."""
+    u = (url or "").strip()
+    if not u:
+        return ""
+    u = u.split("#", 1)[0]
+    m = re.match(r"^([a-zA-Z][a-zA-Z0-9+.-]*://)([^/?#]*)(.*)$", u)
+    if not m:
+        return u.rstrip("/")
+    scheme, host, rest = m.group(1).lower(), m.group(2).lower(), m.group(3)
+    if "?" in rest:
+        path, query = rest.split("?", 1)
+        rest = path.rstrip("/") + "?" + query
+    else:
+        rest = rest.rstrip("/")
+    return scheme + host + rest
+
+
 def collect(categories: list[dict]) -> tuple[list[dict], list[str]]:
     """Fetch every feed in parallel; return (candidates, feed_errors)."""
     jobs = []
@@ -173,7 +194,7 @@ def collect(categories: list[dict]) -> tuple[list[dict], list[str]]:
             c["age_h"] = round(age_h)
         else:
             c["age_h"] = None
-        link_key = c["link"].split("?")[0].rstrip("/")
+        link_key = _link_identity(c["link"])
         title_key = re.sub(r"\W+", "", c["title"].lower())
         if (link_key and link_key in seen_links) or title_key in seen_titles:
             continue
@@ -271,18 +292,28 @@ def curate(candidates: list[dict], categories: list[dict], today: str) -> dict:
             "summary": str(entry.get("summary") or "").strip()[:1000],
             "items": items,
         }
+    picks = sum(len(v["items"]) for v in out.values())
+    if picks == 0:
+        # An empty-but-parseable reply used to publish as a "successful"
+        # briefing with zero picks. Fail instead — main() falls back to raw
+        # headlines with a visible note.
+        raise RuntimeError(
+            "curation returned no usable selections (empty or all-invalid "
+            "categories) — refusing to present this as a curated briefing"
+        )
     return out
 
 
 def build_page(categories: list[dict], digest: dict, generated_at: str,
-               mode: str, errors: list[str]) -> str:
+               mode: str, errors: list[str], curation_note: str = "") -> str:
     sections = []
     for cat in categories:
         d = digest.get(cat["key"], {"summary": "", "items": []})
         sections.append({"key": cat["key"], "name": cat["name"],
                          "summary": d["summary"], "items": d["items"]})
     payload = json.dumps({"generated_at": generated_at, "mode": mode,
-                          "sections": sections, "errors": errors}, ensure_ascii=False)
+                          "sections": sections, "errors": errors,
+                          "curation_note": curation_note}, ensure_ascii=False)
     return """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -339,8 +370,9 @@ def build_page(categories: list[dict], digest: dict, generated_at: str,
     document.getElementById("stale").style.display = "inline-block";
   }
   if (data.mode === "raw") {
-    document.getElementById("banner").innerHTML =
-      '<div class="banner">AI summaries unavailable (set DEEPSEEK_API_KEY in news/.env) — showing raw headlines.</div>';
+    var msg = data.curation_note ||
+      "AI summaries unavailable (set DEEPSEEK_API_KEY in news/.env) — showing raw headlines.";
+    document.getElementById("banner").innerHTML = '<div class="banner">' + esc(msg) + "</div>";
   }
   function ago(iso) {
     if (!iso) return "";
@@ -410,6 +442,7 @@ def main() -> int:
 
     mode = "raw"
     digest: dict = {}
+    curation_note = ""
     if os.getenv("DEEPSEEK_API_KEY"):
         print("Curating with DeepSeek ...")
         try:
@@ -419,7 +452,8 @@ def main() -> int:
                 d = digest.get(cat["key"], {"items": []})
                 print(f"  {cat['key']}: {len(d['items'])} picks")
         except Exception as exc:
-            print(f"WARNING: curation failed ({exc}) — falling back to raw headlines.", file=sys.stderr)
+            curation_note = f"AI curation failed this run ({exc}) — showing raw headlines."
+            print(f"WARNING: {curation_note}", file=sys.stderr)
     else:
         print("No DEEPSEEK_API_KEY — raw headline mode (set news/.env for AI summaries).")
 
@@ -434,10 +468,12 @@ def main() -> int:
 
     generated_at = datetime.now(timezone.utc).isoformat()
     (HERE / "digest.json").write_text(json.dumps(
-        {"generated_at": generated_at, "mode": mode, "digest": digest, "errors": errors},
+        {"generated_at": generated_at, "mode": mode, "digest": digest,
+         "errors": errors, "curation_note": curation_note},
         ensure_ascii=False, indent=2), encoding="utf-8")
     page = HERE / "index.html"
-    page.write_text(build_page(categories, digest, generated_at, mode, errors), encoding="utf-8")
+    page.write_text(build_page(categories, digest, generated_at, mode, errors,
+                               curation_note), encoding="utf-8")
     print(f"Done ({mode}): {page}")
     if args.open:
         webbrowser.open(page.as_uri())

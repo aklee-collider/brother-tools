@@ -12,12 +12,15 @@ clickable links to the actual articles:
 
 ## Setup (Windows)
 
+**Easiest:** double-click `..\setup.cmd` in the main folder — it installs the
+library and creates `.env` for you; `..\check.cmd` verifies everything.
+
+Manual steps, if you prefer:
+
 1. Install Python from <https://www.python.org/downloads/> — tick
    **"Add python.exe to PATH"**.
-2. Install the one library: open a terminal in this folder and run
-   `python -m pip install python-dotenv`
-   (or double-click `..\transcriber\setup.cmd` if you already set up the
-   transcriber — same library).
+2. Install the one library: `python -m pip install -r requirements.txt`
+   (or just run the main `setup.cmd`, which covers both tools).
 3. **AI summaries (recommended):** copy `.env.example` to `.env` and paste
    your DeepSeek key — the same one the transcriber uses
    (<https://platform.deepseek.com>). Without a key the page still builds,
@@ -30,11 +33,17 @@ clickable links to the actual articles:
   Windows task that rebuilds the briefing every day at **07:30** (no popup —
   just open `index.html` whenever). Remove with:
   `schtasks /delete /tn "BrotherNewsDaily" /f`
+  - Runs while the PC was off at 07:30 fire as soon as the PC wakes.
+  - Every run logs to `output\news_log.txt` — if a morning looks stale,
+    that file says what happened.
 
 ## How it stays honest
 
 - The AI picks from **real fetched articles only** — every link on the page
   came from a feed, never invented. If an area has nothing notable, it says so.
+- If the AI curation itself fails or comes back empty, the page falls back
+  to raw headlines **with a visible banner saying so** — never a silently
+  empty "briefing".
 - A feed that fails is listed at the bottom of the page; the rest still work.
 - A page older than ~a day shows a **STALE** badge.
 - Only articles from the last 72 hours are considered (survives weekends).
