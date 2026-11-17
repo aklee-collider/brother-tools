@@ -10,6 +10,13 @@ already; add more in `projects.json` anytime.
 
 ## One-time setup (Windows)
 
+**Easiest:** double-click `..\setup.cmd` in the main folder — it installs the
+libraries, creates `.env` for you, and finishes with a full check of
+everything below. `..\check.cmd` re-runs the check any time (no network, no
+cost).
+
+Manual steps, if you prefer:
+
 1. **Python** — install from <https://www.python.org/downloads/>.
    ⚠ On the first installer screen, tick **"Add python.exe to PATH"**.
 2. **ffmpeg** (splits long recordings into API-sized pieces) — open PowerShell
@@ -20,7 +27,8 @@ already; add more in `projects.json` anytime.
    No winget? Download a release from <https://www.gyan.dev/ffmpeg/builds/>,
    and put `ffmpeg.exe` + `ffprobe.exe` into a new `ffmpeg` folder inside this
    `transcriber` folder. Either way works.
-3. **Libraries** — double-click `setup.cmd`.
+3. **Libraries** — double-click `setup.cmd` (in the main folder), or:
+   `python -m pip install -r requirements.txt`.
 4. **API keys** — two paid APIs (both cheap, pay-as-you-go):
    - **Zhipu BigModel** (transcription): sign up at <https://open.bigmodel.cn>,
      create an API key, top up a small amount (¥10 covers ~2.5 hours of audio).
@@ -46,9 +54,16 @@ already; add more in `projects.json` anytime.
    new recording that finishes syncing is transcribed and summarized
    automatically — results appear in `output\`, the audio is archived to
    `inbox\processed\`.
+   - **No window wanted:** double-click `install_watch.cmd` once — the
+     watcher then starts automatically at logon, no window, activity logged
+     to `output\watch.log`. Remove with
+     `schtasks /delete /tn "BrotherTranscribeWatch" /f`.
+   - Only one watcher can run at a time — starting a second copy (window or
+     scheduled) exits with a clear message instead of fighting over files.
 
-The meeting date is read from the file's modified time, so "next Friday"
-resolves against when you actually met, not when the file synced.
+The meeting date is read from the file's modified time (the recording date),
+so "next Friday" resolves against when you actually met, not when the file
+synced. Each summary states the date it used and how to correct it.
 
 **Manual still works:** drag any audio file onto `transcribe.cmd`, or:
 
@@ -63,6 +78,7 @@ python transcribe.py meeting.m4a --no-summary        # transcript only
 | File | What it is |
 |---|---|
 | `transcript.txt` | everything that was said |
+| `asr_meta.json` | transcription facts (date, length, cost) — used by `--resume` |
 | `summary.md` | overview, outstanding tasks, events, **communication insights** |
 | `tasks.md` | checkbox list of outstanding tasks, high / medium / low |
 | `events.ics` | dated events — double-click to import into your calendar |
@@ -77,6 +93,20 @@ questions to ask, follow-up timing — tailored to the project.
 `projects.json` holds your active projects (key, name, context). The AI reads
 the context to tag each meeting and tailor its advice. Add a project by
 copying an entry and editing it; force a tag with `--project <key>`.
+
+## Fixing a meeting without paying again
+
+The expensive part is transcription; the summary step is a few cents. When a
+meeting went wrong in a fixable way, resume from the saved transcript — the
+audio is **never** re-sent:
+
+```
+python transcribe.py --resume output/meeting_20261117-120000              # summary failed earlier
+python transcribe.py --resume output/meeting_20261117-120000 --date 2026-11-15   # date was wrong
+```
+
+`summary.md`, `tasks.md`, and `events.ics` are rewritten in place; the
+corrected date also lands in the calendar file.
 
 ## Cost & privacy
 
@@ -98,7 +128,17 @@ copying an entry and editing it; force a tag with `--project <key>`.
 - `ASR HTTP 429` (code 1113, "余额不足") → wallet empty — top up at
   open.bigmodel.cn, then re-run.
 - Long file fails with a 30-second error → ffmpeg isn't installed (step 2).
-- Transcript saved but summary failed → your transcript is safe in `output/`;
-  fix the DeepSeek key and re-run.
+- `incomplete conversion` / `ffmpeg failed` → the recording did not convert
+  fully (corrupt file, or the PC slept mid-copy). The tool refuses rather
+  than give you a silently truncated transcript — check the file, re-drop it.
+- `WARNING: N of M audio segments returned no text` → part of the meeting
+  may be missing from the transcript (usually a bad patch of audio). The
+  result is still saved; listen to the original around the gap if in doubt.
+- Transcript saved but summary failed → your transcript is safe in
+  `output\`; fix the DeepSeek key and resume with
+  `python transcribe.py --resume output\<folder>` (no transcription cost).
+- `A watcher is already running` → exactly that. One watcher does all the
+  work; if you're sure none is running (e.g. after a reboot), delete
+  `watch.lock` in this folder and start again.
 - Watcher put a file in `inbox\failed\` → the log (`output\watch.log`) says
   why; fix it and drop the file back into `inbox\` to retry.

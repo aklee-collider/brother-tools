@@ -9,14 +9,33 @@ Two small tools, built to be low-maintenance:
 
 ## Quick start
 
-1. Install Python (<https://www.python.org/downloads/>, tick **"Add python.exe
-   to PATH"**).
-2. **News**: put your DeepSeek key in `news/.env` (optional but recommended),
-   double-click `news/refresh.cmd`. For a daily 07:30 briefing, run
-   `news/install_daily.cmd` once.
-3. **Transcriber**: follow `transcriber/README.md` (ffmpeg + two API keys +
-   `setup.cmd`). Drag a recording onto `transcriber/transcribe.cmd`, or set
-   up the phone → `inbox` sync and leave `watch.cmd` running.
+1. **Double-click `setup.cmd`** — it installs Python libraries, creates the
+   `.env` key files, and then checks everything. (Python itself must be
+   installed first: <https://www.python.org/downloads/>, tick **"Add
+   python.exe to PATH"** — `setup.cmd` tells you if it's missing.)
+2. Paste your API keys into the `.env` files as instructed
+   (`transcriber/.env` needs two, `news/.env` reuses the DeepSeek one).
+3. Run anything ffmpeg-related asks for: open PowerShell once and run
+   `winget install --id Gyan.FFmpeg -e` (only needed for recordings longer
+   than 30 seconds).
+4. **Check any time:** double-click `check.cmd` — no network, no cost, every
+   gap explained in plain language.
+
+## Background automation (optional, one double-click each)
+
+- `news\install_daily.cmd` — daily 07:30 briefing; missed runs (PC was off)
+  fire when the PC wakes; output lands in `news\output\news_log.txt`.
+- `transcriber\install_watch.cmd` — the recording watcher starts at logon
+  with no window; activity lands in `transcriber\output\watch.log`.
+
+## Something failed?
+
+- A meeting summary failed (no money lost): resume from the saved transcript
+  with `python transcriber\transcribe.py --resume output\<folder>` — see the
+  transcriber README.
+- The meeting date came out wrong: same command plus `--date YYYY-MM-DD`.
+- Anything else: `check.cmd` first, then the troubleshooting sections in each
+  tool's README.
 
 ## Ground rules
 
