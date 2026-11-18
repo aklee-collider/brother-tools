@@ -200,7 +200,12 @@ class TestWatcherSingleInstance(unittest.TestCase):
             self.assertTrue(watch.acquire_lock(),
                             "a replacement must acquire after the holder exits")
         watch.release_lock()
-        self.assertFalse(watch.LOCK_FILE.exists(), "a clean exit tidies the file up")
+        # r3 plan conformance: the lock FILE stays in place — deleting it is
+        # racy on Unix (a replacement could lock the old file while a third
+        # process creates and locks a fresh one). Release = close the handle;
+        # the file is only a note for the refusal message.
+        self.assertTrue(watch.LOCK_FILE.exists(),
+                        "release must close the handle, not delete the lock file")
 
     def test_pos_leftover_lock_file_never_blocks(self):
         # Edge: a leftover file with a DEAD pid note (crashed watcher). Under
@@ -592,6 +597,82 @@ class TestClaimSweep(unittest.TestCase):
             watch.sweep_claims()
         self.assertTrue((self.failed / "meet.m4a").exists())
 
+    def test_pos_stray_marker_tidied(self):
+        # r3: a marker whose claim is gone (the child lost the publication
+        # race) has nobody left to protect — the sweep tidies it.
+        marker = self.inbox / "gone.m4a.processing.pid"
+        marker.write_text("12345", encoding="utf-8")
+        with mock.patch.object(watch, "log"):
+            watch.sweep_claims()
+        self.assertFalse(marker.exists())
+        self.assertEqual(list(self.failed.iterdir()), [])
+
+
+# ------------------------------------------------------- r3: ownership first
+class TestTranscribeClaimBeacon(unittest.TestCase):
+    """Review r3 finding 1: ownership must be recognizable BEFORE the child
+    can use the recording. transcribe.py therefore publishes its own PID
+    marker as its first act on a .processing input and REFUSES to run if it
+    cannot publish. (In-process: same PID as this test, real files.)"""
+
+    def _valid_summary_data(self):
+        return {"summary": "s", "project": None, "priorities": [], "events": [],
+                "insights": {"outcome": "unclear", "objections": [], "recommendations": []}}
+
+    def _fake_asr(self, seen: dict):
+        def fake(path, **k):
+            seen["beacon_at_call"] = (Path(str(path) + ".pid").read_text(encoding="utf-8")
+                                      if Path(str(path) + ".pid").exists() else None)
+            return {"transcript": "hello", "duration_s": 2.0, "segments": 1,
+                    "segments_empty": 0, "cost_yuan_est": 0.01, "model": "m"}
+        return fake
+
+    def _run(self, argv_extra):
+        seen = {}
+        out = self.inbox / "out"
+        with mock.patch.object(sys, "argv",
+                               ["transcribe.py", *argv_extra, "--out", str(out)]), \
+             mock.patch.object(transcribe.asr_lib, "transcribe",
+                               side_effect=self._fake_asr(seen)), \
+             mock.patch.object(transcribe.summarize, "summarize",
+                               return_value=self._valid_summary_data()):
+            rc = transcribe.main()
+        return rc, seen
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.inbox = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_beacon_published_before_first_use(self):
+        claim = self.inbox / "meet.m4a.processing"
+        claim.write_text("audio", encoding="utf-8")
+        rc, seen = self._run([str(claim), "--date", "2026-11-18"])
+        self.assertEqual(rc, 0)
+        marker = self.inbox / "meet.m4a.processing.pid"
+        self.assertTrue(marker.exists(), "the marker stays for the watcher to clear")
+        self.assertEqual(seen["beacon_at_call"], str(os.getpid()),
+                         "our PID must be published BEFORE asr reads the recording")
+
+    def test_refuses_to_run_when_marker_unwritable(self):
+        claim = self.inbox / "meet.m4a.processing"
+        claim.write_text("audio", encoding="utf-8")
+        (self.inbox / "meet.m4a.processing.pid").mkdir()  # marker path = a directory
+        rc, seen = self._run([str(claim), "--date", "2026-11-18"])
+        self.assertEqual(rc, 1, "an unrecognizable transcription must refuse to start")
+        self.assertIsNone(seen.get("beacon_at_call"), "the recording must never be read")
+
+    def test_no_marker_for_standalone_file(self):
+        audio = self.inbox / "plain.wav"
+        audio.write_text("audio", encoding="utf-8")
+        rc, seen = self._run([str(audio), "--date", "2026-11-18"])
+        self.assertEqual(rc, 0)
+        self.assertIsNone(seen["beacon_at_call"])
+        self.assertEqual(list(self.inbox.glob("*.pid")), [],
+                         "standalone runs never write markers")
+
 
 # ---------------------------------------------------------------- C3 (r2)
 class TestCompletenessNote(unittest.TestCase):
@@ -609,6 +690,9 @@ class TestCompletenessNote(unittest.TestCase):
     def _meta(self, **kw):
         (self.out / "asr_meta.json").write_text(json.dumps(kw), encoding="utf-8")
 
+    def _meta_raw(self, text: str):
+        (self.out / "asr_meta.json").write_text(text, encoding="utf-8")
+
     def test_warning_on_empty_segments(self):
         self._meta(segments=5, segments_empty=2)
         note = watch._completeness_note(self.out)
@@ -624,16 +708,52 @@ class TestCompletenessNote(unittest.TestCase):
         self.assertIn("cannot verify", watch._completeness_note(self.out))
 
     def test_malformed_meta_names_itself(self):
-        (self.out / "asr_meta.json").write_text("{not json", encoding="utf-8")
+        self._meta_raw("{not json")
         self.assertIn("cannot verify", watch._completeness_note(self.out))
 
     def test_non_dict_meta_names_itself(self):
-        (self.out / "asr_meta.json").write_text("[1, 2]", encoding="utf-8")
+        self._meta_raw("[1, 2]")
         self.assertIn("unexpected shape", watch._completeness_note(self.out))
 
-    def test_non_numeric_counts_name_themselves(self):
-        self._meta(segments="abc", segments_empty=None)
-        self.assertIn("non-numeric", watch._completeness_note(self.out))
+    # r3 finding 2: only true integers with 0 <= empty <= total, total > 0
+    # are trusted. Everything else must be a diagnostic — never a silent
+    # plain DONE, never an exception that kills the watch loop.
+    def test_empty_dict_is_not_silently_complete(self):
+        # r3 probe: {} yielded a plain DONE — missing counts cannot be trusted.
+        self._meta_raw("{}")
+        self.assertIn("cannot verify", watch._completeness_note(self.out))
+
+    def test_fractional_count_rejected(self):
+        self._meta(segments=5, segments_empty=1.5)
+        self.assertIn("cannot verify", watch._completeness_note(self.out))
+
+    def test_infinity_does_not_raise(self):
+        # r3 probe: 1e999 parsed to float infinity and int(inf) raised
+        # OverflowError AFTER the audio was already archived — killing the
+        # watch loop. Must be a diagnostic instead.
+        self._meta_raw('{"segments": 5, "segments_empty": 1e999}')
+        self.assertIn("cannot verify", watch._completeness_note(self.out))
+
+    def test_bool_count_rejected(self):
+        # bool is an int subclass; true must not silently count as 1.
+        self._meta(segments=5, segments_empty=True)
+        self.assertIn("cannot verify", watch._completeness_note(self.out))
+
+    def test_string_count_rejected(self):
+        self._meta(segments=5, segments_empty="2")
+        self.assertIn("cannot verify", watch._completeness_note(self.out))
+
+    def test_negative_empty_rejected(self):
+        self._meta(segments=5, segments_empty=-1)
+        self.assertIn("cannot verify", watch._completeness_note(self.out))
+
+    def test_empty_greater_than_total_rejected(self):
+        self._meta(segments=2, segments_empty=3)
+        self.assertIn("cannot verify", watch._completeness_note(self.out))
+
+    def test_zero_total_rejected(self):
+        self._meta(segments=0, segments_empty=0)
+        self.assertIn("cannot verify", watch._completeness_note(self.out))
 
 
 # ---------------------------------------------------------------- r2 finding 1

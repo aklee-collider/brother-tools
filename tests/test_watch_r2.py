@@ -17,6 +17,10 @@ Every claim here is stated as the defect it would have let escape:
   .processing recording safe to move — the child can outlive the watcher.
 - TestWarningDurability .......... r2 finding 3 / condition 3: empty-segment
   warnings and metadata diagnostics must reach watch.log.
+- TestOwnershipHandoff ........... r3 finding 1: ownership is published by
+  the child BEFORE it uses the recording — pre-publication claims are
+  recoverable even with a live child process; a child that cannot publish
+  refuses to start.
 
 Set BROTHER_WATCH_SOURCE=main to build fixtures from the pre-fix baseline
 (red-on-baseline runs); the default is the working tree. No network, no API
@@ -55,7 +59,8 @@ def spec_for(audio: Path) -> dict:
     name = audio.name
     if name.endswith(".processing"):
         name = name[: -len(".processing")]
-    spec = {"META": "ok", "EMPTY": "0", "SEGMENTS": "5", "SLEEP": "0"}
+    spec = {"META": "ok", "EMPTY": "0", "SEGMENTS": "5", "SLEEP": "0",
+            "PUBLISH_DELAY": "0", "PUBLISH_FAIL": "0"}
     p = audio.parent / (name + ".stubspec")
     if p.exists():
         for line in p.read_text(encoding="utf-8").splitlines():
@@ -71,6 +76,16 @@ def main() -> int:
     out = Path(argv[argv.index("--out") + 1])
     out.mkdir(parents=True, exist_ok=True)
     spec = spec_for(audio)
+    # Mirror transcribe.py's ownership-first contract, including the window
+    # BEFORE publication (PUBLISH_DELAY simulates interpreter startup).
+    time.sleep(float(spec["PUBLISH_DELAY"]))
+    beacon = None
+    if audio.name.endswith(".processing"):
+        beacon = audio.with_name(audio.name + ".pid")
+        if spec["PUBLISH_FAIL"] == "1":
+            print("ERROR: cannot write the processing marker", flush=True)
+            return 3
+        beacon.write_text(str(os.getpid()), encoding="utf-8")
     time.sleep(float(spec["SLEEP"]))
     (out / "transcript.txt").write_text("stub transcript for " + audio.name,
                                         encoding="utf-8")
@@ -234,7 +249,7 @@ class TestCrashDuringTranscription(WatcherTestCase):
         pid_file = self.fx / "inbox" / "meeting.m4a.processing.pid"
         wait_until(lambda: claim.exists() and pid_file.exists(),
                    STABLE_POLLS * POLL_SECS + 30,
-                   "watcher to claim the recording and write the child-pid beacon")
+                   "watcher to claim the recording and the child to publish its beacon")
         child_pid = int(pid_file.read_text(encoding="utf-8"))
         self.child_pids.append(child_pid)  # drained in tearDown even on failure
         a.kill()  # watcher crashes MID-TRANSCRIPTION; the stub child outlives it
@@ -255,6 +270,60 @@ class TestCrashDuringTranscription(WatcherTestCase):
         self.assertFalse(pid_file.exists(), "the beacon goes with the claim")
         self.assertIn("RECOVERED", read_log(self.fx))
         self.stop(c)
+
+
+# ----------------------- r3 finding 1 (ownership published before first use)
+
+class TestOwnershipHandoff(WatcherTestCase):
+    """Review r3 finding 1: the child publishes its PID BEFORE touching the
+    recording. A claim with no marker therefore has no owner yet — recovery
+    may move it even though a child process exists (it has not opened the
+    audio). RED on d64648c: the watcher wrote the beacon itself right after
+    spawn, so the same scenario froze the claim under a pre-publication
+    child that could then lose its recording mid-flight."""
+
+    def test_claim_recoverable_before_child_publishes(self):
+        audio = self.fx / "inbox" / "meeting.m4a"
+        audio.write_bytes(b"0" * 100)
+        (self.fx / "inbox" / "meeting.m4a.stubspec").write_text(
+            "PUBLISH_DELAY=60\n", encoding="utf-8")
+        a = self.run_watcher()
+        claim = self.fx / "inbox" / "meeting.m4a.processing"
+        pid_file = self.fx / "inbox" / "meeting.m4a.processing.pid"
+        wait_until(lambda: claim.exists(), STABLE_POLLS * POLL_SECS + 30,
+                   "watcher to claim the recording")
+        time.sleep(2)  # the child is spawned right after the claim
+        self.assertFalse(pid_file.exists(),
+                         "pre-publication: the child has not claimed ownership yet")
+        a.kill()  # watcher dies in the launch window; the child is still starting
+        a.communicate(timeout=10)
+        c = self.run_watcher()
+        wait_until(lambda: (self.fx / "inbox" / "failed" / "meeting.m4a").exists(),
+                   3 * POLL_SECS + 20,
+                   "unowned claim recovered even though the child process exists")
+        self.assertFalse(pid_file.exists(),
+                         "a pre-publication child leaves no marker behind")
+        self.assertEqual(list((self.fx / "inbox").glob("*.processing")), [])
+        self.stop(c)  # the orphaned stub self-exits when its delay elapses
+
+    def test_refused_publication_fails_the_job(self):
+        # The failed-write leg of the r3 requirement: a child that cannot
+        # publish ownership refuses to start, and the watcher files the
+        # recording into failed/ with no marker left behind.
+        audio = self.fx / "inbox" / "meeting.m4a"
+        audio.write_bytes(b"0" * 100)
+        (self.fx / "inbox" / "meeting.m4a.stubspec").write_text(
+            "PUBLISH_FAIL=1\n", encoding="utf-8")
+        a = self.run_watcher()
+        wait_until(lambda: (self.fx / "inbox" / "failed" / "meeting.m4a").exists(),
+                   STABLE_POLLS * POLL_SECS + 40,
+                   "a child that cannot publish ownership fails loudly into failed/")
+        log = read_log(self.fx)
+        self.assertIn("FAILED meeting.m4a", log)
+        self.assertNotIn("DONE meeting.m4a", log)
+        self.assertFalse((self.fx / "inbox" / "meeting.m4a.processing.pid").exists(),
+                         "a refusing child leaves no marker behind")
+        self.stop(a)
 
 
 # ------------------------------- r2 finding 3 / condition 3 (durable status)

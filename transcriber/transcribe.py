@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import sys
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -230,6 +231,22 @@ def main() -> int:
         if not args.audio:
             ap.error("an audio file is required (or use --resume OUT_DIR)")
         audio = Path(args.audio)
+        # Ownership-first (watcher runs only): publish our PID next to the
+        # claimed recording BEFORE touching it, so a replacement watcher can
+        # recognize this recording as owned. No marker yet = no owner yet = a
+        # recovering watcher may move the claim (we have not even opened the
+        # file). If we cannot publish the marker we refuse to start — an
+        # unrecognizable transcription must not consume the recording.
+        # Cleanup is the watcher's job (and the sweep's backstop); a leftover
+        # marker with a dead PID is harmless.
+        if audio.name.endswith(".processing"):
+            beacon = audio.with_name(audio.name + ".pid")
+            try:
+                beacon.write_text(str(os.getpid()), encoding="utf-8")
+            except OSError as exc:
+                print(f"ERROR: cannot write the processing marker {beacon.name}: {exc} "
+                      f"— refusing to start so the recording stays safe.", file=sys.stderr)
+                return 1
         if not audio.exists():
             print(f"ERROR: file not found: {audio}", file=sys.stderr)
             return 1
@@ -297,7 +314,6 @@ def main() -> int:
     print(f"Done: {out_dir}")
     if args.open:
         try:
-            import os
             os.startfile(out_dir)  # Windows
         except Exception:
             pass

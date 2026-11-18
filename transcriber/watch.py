@@ -16,11 +16,16 @@ Two safety mechanisms, both OS-level so they survive crashes:
   its whole lifetime. A second copy cannot take that byte — the OS decides
   atomically, so even two copies started at the same instant cannot both win.
   When the watcher exits or crashes, the OS releases the byte by itself:
-  starting a new watcher after a crash needs no cleanup and no lock-file
-  deletion.
+  starting a new watcher after a crash needs no cleanup. The lock FILE stays
+  in place forever (deleting it would be racy on Unix — a replacement could
+  lock the old file while a third process creates a fresh one); its content
+  is just a note for the refusal message.
 - Claim safety: while a recording is being processed it is renamed to
-  <name>.processing, and the transcribe.py child's PID is written next to it
-  (<name>.processing.pid). If the watcher itself crashes but the child keeps
+  <name>.processing, and the transcribe.py child publishes its own PID next
+  to it (<name>.processing.pid) as its FIRST act — before opening the file.
+  Ownership is therefore recognizable before the recording can be used: a
+  claim without a marker has no owner yet and may be recovered; a claim with
+  a live marker is left alone. So if the watcher crashes but the child keeps
   running (Windows lets a child outlive its parent), a replacement watcher
   sees the live PID and leaves that recording alone until the child is done.
 """
@@ -72,13 +77,6 @@ def _dest(folder: Path, name: str) -> Path:
 
 def _pid_file(claimed: Path) -> Path:
     return claimed.with_name(claimed.name + ".pid")
-
-
-def _write_pid_file(pid_file: Path, pid: int) -> None:
-    try:
-        pid_file.write_text(str(pid), encoding="utf-8")
-    except OSError:
-        pass  # worst case the claim looks ownerless — the sweep still retries safely
 
 
 def _read_pid_file(pid_file: Path) -> int | None:
@@ -190,13 +188,9 @@ def release_lock() -> None:
     except OSError:
         pass
     try:
-        f.close()
+        f.close()  # closing the handle IS the release; the file stays in place
     except OSError:
         pass
-    try:
-        LOCK_FILE.unlink()  # clean exit tidies up; fails harmlessly if a rival
-    except OSError:         # is mid-acquire with the file open — the byte lock,
-        pass                # not the file, is what decides who runs
 
 
 # ------------------------------------------------------------------ claims
@@ -207,8 +201,11 @@ def _completeness_note(out_dir: Path) -> str:
     transcribe.py counts billed-but-empty segments in segments_empty. A
     positive count means parts of the recording came back with no text, so
     the transcript may be incomplete — that must reach watch.log, not die in
-    the child's captured output. Anything unreadable produces a clear
-    diagnostic instead of silence; it never fails the DONE itself.
+    the child's captured output. Only true integers with 0 <= empty <= total
+    and a positive total are trusted; ANYTHING else (missing keys, floats,
+    bools, strings, infinity like 1e999, counts that make no sense) produces
+    a clear diagnostic instead of silence — never an exception, so the
+    watcher keeps running and the next recording still processes.
     """
     try:
         meta = json.loads((out_dir / "asr_meta.json").read_text(encoding="utf-8"))
@@ -218,11 +215,13 @@ def _completeness_note(out_dir: Path) -> str:
         return f"  (asr_meta.json unreadable: {exc} — cannot verify segment completeness)"
     if not isinstance(meta, dict):
         return "  (asr_meta.json has an unexpected shape — cannot verify segment completeness)"
-    try:
-        empty = int(meta.get("segments_empty") or 0)
-        total = int(meta.get("segments") or 0)
-    except (TypeError, ValueError):
-        return "  (asr_meta.json has non-numeric segment counts — cannot verify segment completeness)"
+    empty, total = meta.get("segments_empty"), meta.get("segments")
+    if (isinstance(empty, bool) or isinstance(total, bool)
+            or not isinstance(empty, int) or not isinstance(total, int)):
+        return "  (asr_meta.json has non-integer segment counts — cannot verify segment completeness)"
+    if total <= 0 or empty < 0 or empty > total:
+        return (f"  (asr_meta.json segment counts make no sense: empty={empty} "
+                f"of total={total} — cannot verify segment completeness)")
     if empty > 0:
         return (f"  WARNING: {empty} of {total} audio segment(s) transcribed empty —"
                 f" transcript may be missing parts; review {out_dir.name}")
@@ -249,10 +248,13 @@ def process_one(path: Path) -> bool:
         log(f"FAILED {path.name}: cannot launch transcribe.py ({exc})")
         os.rename(claimed, _dest(FAILED, path.name))
         return False
-    # Crash beacon: if THIS watcher dies while the child keeps running, the
-    # pid file is what stops a replacement watcher from moving the claim.
+    # Ownership beacon: the CHILD publishes its own PID as its first act
+    # (before it opens the recording), so between spawn and publication it
+    # has not touched the file — a watcher lost in that window leaves a
+    # claim that recovery safely moves. This watcher only clears the marker
+    # once the child is done (a hard kill on timeout skips the child's own
+    # cleanup).
     pid_file = _pid_file(claimed)
-    _write_pid_file(pid_file, proc.pid)
     timed_out = False
     try:
         out, err = proc.communicate(timeout=PROCESS_TIMEOUT)
@@ -263,7 +265,11 @@ def process_one(path: Path) -> bool:
     _clear_pid_file(pid_file)  # child is done (or killed) — beacon served
     if not timed_out and proc.returncode == 0:
         os.rename(claimed, _dest(PROCESSED, path.name))
-        log(f"DONE {path.name} -> {out_dir}{_completeness_note(out_dir)}")
+        try:
+            note = _completeness_note(out_dir)
+        except Exception as exc:  # a note must never kill the watch loop
+            note = f"  (completeness check failed: {exc} — cannot verify segment completeness)"
+        log(f"DONE {path.name} -> {out_dir}{note}")
         return True
     if timed_out:
         err = f"timeout after {PROCESS_TIMEOUT}s"
@@ -276,11 +282,19 @@ def sweep_claims() -> None:
     """Move finished/detached .processing claims back for a retry.
 
     Runs at startup AND on every poll, always under the single-instance
-    lock. A claim whose transcribe child is STILL RUNNING (its watcher
-    crashed, the child outlived it) is left alone — moving the file under a
-    live transcription would break it. It is re-checked every poll, so once
-    that child exits, the claim lands in failed/ for an easy re-drop.
+    lock. A claim whose transcribe child has published a STILL-RUNNING PID
+    (its watcher crashed, the child outlived it) is left alone — moving the
+    file under a live transcription would break it. A claim with no marker
+    has no owner yet: the child publishes before it touches the recording,
+    so moving it is safe. Claims are re-checked every poll, so once a child
+    exits, its claim lands in failed/ for an easy re-drop. Stray markers
+    whose claim is gone (the child lost the race) are tidied up.
     """
+    for stray in INBOX.glob("*.processing.pid"):
+        claim = INBOX / stray.name[: -len(".pid")]
+        if not claim.exists():
+            _clear_pid_file(stray)
+            log(f"Removed a stray pid marker without a claim: {stray.name}")
     for stale in INBOX.glob("*.processing"):
         pid_file = _pid_file(stale)
         owner = _read_pid_file(pid_file)
