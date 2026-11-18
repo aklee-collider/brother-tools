@@ -76,16 +76,27 @@ def main() -> int:
     out = Path(argv[argv.index("--out") + 1])
     out.mkdir(parents=True, exist_ok=True)
     spec = spec_for(audio)
-    # Mirror transcribe.py's ownership-first contract, including the window
-    # BEFORE publication (PUBLISH_DELAY simulates interpreter startup).
+    # Mirror transcribe.py's ownership contract: take the marker's byte lock
+    # BEFORE touching the recording and hold it until exit. PUBLISH_DELAY
+    # simulates interpreter startup (the pre-ownership window).
     time.sleep(float(spec["PUBLISH_DELAY"]))
-    beacon = None
     if audio.name.endswith(".processing"):
-        beacon = audio.with_name(audio.name + ".pid")
+        marker = audio.with_name(audio.name + ".pid")
         if spec["PUBLISH_FAIL"] == "1":
-            print("ERROR: cannot write the processing marker", flush=True)
+            print("ERROR: cannot open the processing marker", flush=True)
             return 3
-        beacon.write_text(str(os.getpid()), encoding="utf-8")
+        mfd = os.open(marker, os.O_RDWR | os.O_CREAT)
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(mfd, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.lockf(mfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        os.ftruncate(mfd, 0)
+        os.write(mfd, str(os.getpid()).encode())
+        # The marker is byte-locked (unreadable from outside by design) —
+        # publish our pid in the out dir so the test can drain us later.
+        (out / "stub.pid").write_text(str(os.getpid()), encoding="utf-8")
     time.sleep(float(spec["SLEEP"]))
     (out / "transcript.txt").write_text("stub transcript for " + audio.name,
                                         encoding="utf-8")
@@ -250,7 +261,14 @@ class TestCrashDuringTranscription(WatcherTestCase):
         wait_until(lambda: claim.exists() and pid_file.exists(),
                    STABLE_POLLS * POLL_SECS + 30,
                    "watcher to claim the recording and the child to publish its beacon")
-        child_pid = int(pid_file.read_text(encoding="utf-8"))
+
+        def _stub_pid_file():
+            files = list(self.fx.glob("output/*/stub.pid"))
+            return files[0] if files else None
+
+        wait_until(lambda: _stub_pid_file() is not None,
+                   10, "stub pid sidecar to appear")
+        child_pid = int(_stub_pid_file().read_text(encoding="utf-8"))
         self.child_pids.append(child_pid)  # drained in tearDown even on failure
         a.kill()  # watcher crashes MID-TRANSCRIPTION; the stub child outlives it
         a.communicate(timeout=10)

@@ -21,13 +21,13 @@ Two safety mechanisms, both OS-level so they survive crashes:
   lock the old file while a third process creates a fresh one); its content
   is just a note for the refusal message.
 - Claim safety: while a recording is being processed it is renamed to
-  <name>.processing, and the transcribe.py child publishes its own PID next
-  to it (<name>.processing.pid) as its FIRST act — before opening the file.
-  Ownership is therefore recognizable before the recording can be used: a
-  claim without a marker has no owner yet and may be recovered; a claim with
-  a live marker is left alone. So if the watcher crashes but the child keeps
-  running (Windows lets a child outlive its parent), a replacement watcher
-  sees the live PID and leaves that recording alone until the child is done.
+  <name>.processing, and ownership of the claim is decided by ONE atomic
+  thing: the byte lock on the marker file (<name>.processing.pid). The
+  transcribe.py child takes that lock as its first act — before opening the
+  recording — and holds it for its whole run. Recovery must win the same
+  lock before it may move the claim, so claiming and recovering cannot
+  overlap: whoever loses the lock attempt loses atomically, and the OS
+  releases the lock when a process exits or crashes.
 """
 
 from __future__ import annotations
@@ -93,28 +93,20 @@ def _clear_pid_file(pid_file: Path) -> None:
         pass
 
 
-def _pid_alive(pid: int) -> bool:
-    """Is a process with this PID running right now?"""
-    if os.name != "nt":
-        try:
-            os.kill(pid, 0)
-            return True
-        except OSError:
-            return False
-    import ctypes
-    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-    STILL_ACTIVE = 259
-    k32 = ctypes.windll.kernel32
-    h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-    if not h:
-        return False
+def _release_marker_fd(fd: int) -> None:
     try:
-        code = ctypes.c_ulong()
-        if not k32.GetExitCodeProcess(h, ctypes.byref(code)):
-            return False
-        return code.value == STILL_ACTIVE
-    finally:
-        k32.CloseHandle(h)
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.lockf(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    try:
+        os.close(fd)
+    except OSError:
+        pass
 
 
 # -------------------------------------------------------------------- lock
@@ -282,13 +274,20 @@ def sweep_claims() -> None:
     """Move finished/detached .processing claims back for a retry.
 
     Runs at startup AND on every poll, always under the single-instance
-    lock. A claim whose transcribe child has published a STILL-RUNNING PID
-    (its watcher crashed, the child outlived it) is left alone — moving the
-    file under a live transcription would break it. A claim with no marker
-    has no owner yet: the child publishes before it touches the recording,
-    so moving it is safe. Claims are re-checked every poll, so once a child
-    exits, its claim lands in failed/ for an easy re-drop. Stray markers
-    whose claim is gone (the child lost the race) are tidied up.
+    lock. Ownership of a claim is decided by ONE atomic thing: the byte
+    lock on its marker file. The transcribe child locks the marker before
+    it touches the recording; this sweep must win the same lock before it
+    may move the claim, so claiming and recovering cannot overlap — there
+    is no window between "checking" and "moving".
+
+    - Marker locked (a live transcription, e.g. a crashed watcher's orphan
+      child): leave the claim alone, announce it once, re-check every poll.
+    - Marker free or missing: nobody owns the recording. The sweep creates
+      the marker itself if needed, moves the claim to failed/ (a re-drop
+      retries it), releases the lock, then tidies the marker. A child that
+      arrives after the move finds no recording and exits before
+      transcribing anything.
+    Stray markers whose claim is already gone are tidied up.
     """
     for stray in INBOX.glob("*.processing.pid"):
         claim = INBOX / stray.name[: -len(".pid")]
@@ -296,23 +295,46 @@ def sweep_claims() -> None:
             _clear_pid_file(stray)
             log(f"Removed a stray pid marker without a claim: {stray.name}")
     for stale in INBOX.glob("*.processing"):
-        pid_file = _pid_file(stale)
-        owner = _read_pid_file(pid_file)
-        if owner is not None and _pid_alive(owner):
+        marker = _pid_file(stale)
+        owner_note = _read_pid_file(marker)  # best-effort, for the log only
+        try:
+            fd = os.open(marker, os.O_RDWR | os.O_CREAT)  # tombstone if absent
+        except OSError as exc:
+            log(f"SKIP {stale.name}: cannot open the marker ({exc}) — will retry.")
+            continue
+        locked = False
+        try:
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            locked = True
+        except OSError:
+            pass
+        if not locked:
+            os.close(fd)
             if stale.name not in _ANNOUNCED_ALIVE:
                 _ANNOUNCED_ALIVE.add(stale.name)
-                log(f"CLAIM {stale.name}: still being transcribed by PID {owner} "
-                    "(its watcher crashed) — leaving it until that finishes.")
+                who = (f"PID {owner_note}" if owner_note is not None
+                       else "a live transcription")
+                log(f"CLAIM {stale.name}: {who} — still being transcribed "
+                    "(marker held). Leaving it until that finishes.")
             continue
+        # We hold the marker lock: no child can claim this recording now.
+        # Move it while still holding the lock, release, then tidy the marker.
         original = stale.name[: -len(".processing")]
         try:
             os.rename(stale, _dest(FAILED, original))
         except OSError as exc:
             log(f"SKIP {stale.name}: cannot move it right now ({exc}) — will retry.")
+            _release_marker_fd(fd)
             continue
+        _release_marker_fd(fd)
         _ANNOUNCED_ALIVE.discard(stale.name)
-        _clear_pid_file(pid_file)
-        owner_txt = f"PID {owner}" if owner is not None else "no pid marker"
+        _clear_pid_file(marker)
+        owner_txt = f"PID {owner_note}" if owner_note is not None else "no live owner"
         log(f"RECOVERED claim (owner {owner_txt}) -> failed/: {original}")
 
 

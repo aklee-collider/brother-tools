@@ -19,6 +19,7 @@ import sys
 import tempfile
 import unittest
 import wave
+from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
 
@@ -536,11 +537,47 @@ class TestMeetingDateVisibility(unittest.TestCase):
                           "the today-default must say how to correct it")
 
 
-# ---------------------------------------------------------------- C2 (r2)
+# ---------------------------------------------------------------- C2 (r2/r4)
+def _lock_byte(fd: int) -> None:
+    """Take the byte-0 lock non-blocking; raise OSError if held elsewhere."""
+    if os.name == "nt":
+        import msvcrt
+        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+    else:
+        import fcntl
+        fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _unlock_byte(fd: int) -> None:
+    if os.name == "nt":
+        import msvcrt
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+        fcntl.lockf(fd, fcntl.LOCK_UN)
+
+
+@contextmanager
+def hold_marker_lock(path: Path):
+    """Hold a file's byte-0 lock from this process (like a live child)."""
+    fd = os.open(path, os.O_RDWR | os.O_CREAT)
+    _lock_byte(fd)
+    try:
+        yield fd
+    finally:
+        try:
+            _unlock_byte(fd)
+        except OSError:
+            pass
+        os.close(fd)
+
+
 class TestClaimSweep(unittest.TestCase):
-    """Review r2 condition 2: a transcribe child can outlive its crashed
-    watcher on Windows, so a .processing claim with a LIVE child pid must
-    never be moved — the sweep re-checks every poll instead."""
+    """Review r2 condition 2 / r4 finding: claiming and recovering the same
+    recording are mutually exclusive — the marker's byte lock decides. The
+    child locks the marker before touching the recording; the sweep must win
+    the same lock before moving the claim. There is no check-then-move
+    window left to lose a race in."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -553,31 +590,51 @@ class TestClaimSweep(unittest.TestCase):
         watch.INBOX, watch.FAILED = self.inbox, self.failed
         self.old_announced = set(watch._ANNOUNCED_ALIVE)
         watch._ANNOUNCED_ALIVE.clear()
+        self.holders = []
 
     def tearDown(self):
+        for h in self.holders:
+            h.kill()
+            h.wait()
         watch.INBOX, watch.FAILED = self.old_inbox, self.old_failed
         watch._ANNOUNCED_ALIVE.clear()
         watch._ANNOUNCED_ALIVE.update(self.old_announced)
         self.tmp.cleanup()
 
-    def test_neg_live_child_claim_left_alone(self):
-        # The r2 defect class: moving this claim would break a transcription
-        # that is still running (its watcher crashed mid-job).
-        sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
-        try:
-            claim = self.inbox / "meet.m4a.processing"
-            claim.write_text("audio", encoding="utf-8")
-            watch._pid_file(claim).write_text(str(sleeper.pid), encoding="utf-8")
-            with mock.patch.object(watch, "log"):
-                watch.sweep_claims()
-            self.assertTrue(claim.exists(), "a live child's claim must not be moved")
-            self.assertEqual(list(self.failed.iterdir()), [])
-        finally:
-            sleeper.kill()
-            sleeper.wait()
+    def _lock_holder(self, marker: Path):
+        """A real second process holding the marker's byte-0 lock for 60 s."""
+        h = subprocess.Popen([sys.executable, "-c",
+            "import os, sys, time\n"
+            "f = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT)\n"
+            "if os.name == 'nt':\n"
+            "    import msvcrt; msvcrt.locking(f, msvcrt.LK_NBLCK, 1)\n"
+            "else:\n"
+            "    import fcntl; fcntl.lockf(f, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+            "print('HELD', flush=True)\n"
+            "time.sleep(60)\n", str(marker)],
+            stdout=subprocess.PIPE, text=True)
+        self.holders.append(h)
+        return h
 
-    def test_pos_dead_child_claim_recovered(self):
-        # Just-outside edge: the beacon pid is real but the process exited.
+    def test_neg_locked_marker_claim_left_alone(self):
+        # The r4 defect class, forced: the marker's PID note is DEAD (that
+        # alone made the pre-r4 sweep move the claim) but a LIVE transcription
+        # holds the marker lock — the lock is the decision, not the PID.
+        claim = self.inbox / "meet.m4a.processing"
+        claim.write_text("audio", encoding="utf-8")
+        marker = watch._pid_file(claim)
+        marker.write_text("999999", encoding="utf-8")
+        holder = self._lock_holder(marker)
+        self.assertEqual(holder.stdout.readline().strip(), "HELD")
+        with mock.patch.object(watch, "log"):
+            watch.sweep_claims()
+        self.assertTrue(claim.exists(), "a locked marker means the claim is owned")
+        self.assertTrue(marker.exists(), "the owner's marker must survive")
+        self.assertEqual(list(self.failed.iterdir()), [])
+
+    def test_pos_unlocked_marker_recovered(self):
+        # Just-outside edge: marker present with a dead PID note, NO lock —
+        # nobody owns the recording; the sweep wins the lock and moves it.
         dead = subprocess.Popen([sys.executable, "-c", "pass"])
         dead.wait()
         claim = self.inbox / "meet.m4a.processing"
@@ -587,15 +644,18 @@ class TestClaimSweep(unittest.TestCase):
             watch.sweep_claims()
         self.assertFalse(claim.exists())
         self.assertTrue((self.failed / "meet.m4a").exists())
-        self.assertFalse(watch._pid_file(claim).exists(), "the pid marker goes with the claim")
+        self.assertFalse(watch._pid_file(claim).exists(), "the marker is tidied with the claim")
 
-    def test_pos_ownerless_claim_recovered(self):
-        # Birth shape: a claim left by a crash between spawn and beacon write.
+    def test_pos_ownerless_claim_recovered_and_tombstone_cleaned(self):
+        # Birth shape: a claim with no marker at all (crash before the child
+        # claimed it). The sweep tombstones the marker itself, moves the
+        # claim, and leaves no marker behind.
         claim = self.inbox / "meet.m4a.processing"
         claim.write_text("audio", encoding="utf-8")
         with mock.patch.object(watch, "log"):
             watch.sweep_claims()
         self.assertTrue((self.failed / "meet.m4a").exists())
+        self.assertFalse(watch._pid_file(claim).exists(), "the tombstone is tidied")
 
     def test_pos_stray_marker_tidied(self):
         # r3: a marker whose claim is gone (the child lost the publication
@@ -608,12 +668,12 @@ class TestClaimSweep(unittest.TestCase):
         self.assertEqual(list(self.failed.iterdir()), [])
 
 
-# ------------------------------------------------------- r3: ownership first
+# ------------------------------------------------- r3/r4: ownership first
 class TestTranscribeClaimBeacon(unittest.TestCase):
-    """Review r3 finding 1: ownership must be recognizable BEFORE the child
-    can use the recording. transcribe.py therefore publishes its own PID
-    marker as its first act on a .processing input and REFUSES to run if it
-    cannot publish. (In-process: same PID as this test, real files.)"""
+    """Review r3 finding 1 + r4 finding: the child must take the marker's
+    byte lock BEFORE it can use the recording, and must refuse to start if
+    the marker cannot be opened, locked, or written. The lock is what makes
+    claiming mutually exclusive with recovery. (In-process: real files.)"""
 
     def _valid_summary_data(self):
         return {"summary": "s", "project": None, "priorities": [], "events": [],
@@ -621,8 +681,24 @@ class TestTranscribeClaimBeacon(unittest.TestCase):
 
     def _fake_asr(self, seen: dict):
         def fake(path, **k):
-            seen["beacon_at_call"] = (Path(str(path) + ".pid").read_text(encoding="utf-8")
-                                      if Path(str(path) + ".pid").exists() else None)
+            marker = Path(str(path) + ".pid")
+            seen["marker_at_call"] = marker.exists()
+            seen["locked_at_call"] = None
+            if marker.exists():
+                try:
+                    fd = os.open(marker, os.O_RDWR)
+                except OSError:
+                    seen["locked_at_call"] = None
+                else:
+                    try:
+                        try:
+                            _lock_byte(fd)
+                            seen["locked_at_call"] = False  # we got it: child did NOT
+                            _unlock_byte(fd)
+                        except OSError:
+                            seen["locked_at_call"] = True   # child holds it
+                    finally:
+                        os.close(fd)
             return {"transcript": "hello", "duration_s": 2.0, "segments": 1,
                     "segments_empty": 0, "cost_yuan_est": 0.01, "model": "m"}
         return fake
@@ -640,21 +716,61 @@ class TestTranscribeClaimBeacon(unittest.TestCase):
         return rc, seen
 
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
+        # ignore_cleanup_errors: the in-process child holds its marker lock
+        # until the test PROCESS exits (by design — the OS releases it), so
+        # Windows cannot delete the locked marker at cleanup time.
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.inbox = Path(self.tmp.name)
 
     def tearDown(self):
         self.tmp.cleanup()
 
-    def test_beacon_published_before_first_use(self):
+    def test_marker_locked_before_first_use(self):
+        # Order 1 (transcription claims first): by the time asr can read the
+        # recording, the child already holds the marker lock — recovery at
+        # that instant must lose the lock and leave the claim alone.
         claim = self.inbox / "meet.m4a.processing"
         claim.write_text("audio", encoding="utf-8")
         rc, seen = self._run([str(claim), "--date", "2026-11-18"])
         self.assertEqual(rc, 0)
-        marker = self.inbox / "meet.m4a.processing.pid"
-        self.assertTrue(marker.exists(), "the marker stays for the watcher to clear")
-        self.assertEqual(seen["beacon_at_call"], str(os.getpid()),
-                         "our PID must be published BEFORE asr reads the recording")
+        self.assertTrue(seen["marker_at_call"])
+        self.assertTrue(seen["locked_at_call"],
+                        "the marker must be LOCKED before asr reads the recording")
+
+    def test_refuses_to_run_when_marker_locked_by_other(self):
+        # Order 2 (recovery wins): the sweep holds the marker lock — the
+        # child must exit BEFORE transcription, never reading the recording.
+        claim = self.inbox / "meet.m4a.processing"
+        claim.write_text("audio", encoding="utf-8")
+        with hold_marker_lock(self.inbox / "meet.m4a.processing.pid"):
+            rc, seen = self._run([str(claim), "--date", "2026-11-18"])
+        self.assertEqual(rc, 1, "a recovering claim must not be transcribed")
+        self.assertIsNone(seen.get("marker_at_call"), "the recording must never be read")
+
+    def test_recovery_wins_child_exits_before_transcription(self):
+        # The full order-2 flow: recovery moves the unowned claim first; a
+        # child started afterwards finds no recording and exits — with the
+        # marker it created tidied by the next sweep.
+        claim = self.inbox / "meet.m4a.processing"
+        claim.write_text("audio", encoding="utf-8")
+        failed = self.inbox / "failed"
+        failed.mkdir()  # production main() creates these before any sweep
+        with mock.patch.object(watch, "log"), \
+             mock.patch.object(watch, "INBOX", self.inbox), \
+             mock.patch.object(watch, "FAILED", failed):
+            watch.sweep_claims()
+        self.assertTrue((failed / "meet.m4a").exists(),
+                        "recovery moved the unowned claim")
+        rc, seen = self._run([str(claim), "--date", "2026-11-18"])
+        self.assertEqual(rc, 1, "no recording = nothing to transcribe")
+        self.assertIsNone(seen.get("marker_at_call"), "the recording must never be read")
+        os.close(transcribe._CLAIM_MARKER_FD)  # simulate the child process exiting
+        with mock.patch.object(watch, "log"), \
+             mock.patch.object(watch, "INBOX", self.inbox), \
+             mock.patch.object(watch, "FAILED", failed):
+            watch.sweep_claims()
+        self.assertEqual(list(self.inbox.glob("*.pid")), [],
+                         "the child's leftover marker is tidied by the next sweep")
 
     def test_refuses_to_run_when_marker_unwritable(self):
         claim = self.inbox / "meet.m4a.processing"
@@ -662,14 +778,14 @@ class TestTranscribeClaimBeacon(unittest.TestCase):
         (self.inbox / "meet.m4a.processing.pid").mkdir()  # marker path = a directory
         rc, seen = self._run([str(claim), "--date", "2026-11-18"])
         self.assertEqual(rc, 1, "an unrecognizable transcription must refuse to start")
-        self.assertIsNone(seen.get("beacon_at_call"), "the recording must never be read")
+        self.assertIsNone(seen.get("marker_at_call"), "the recording must never be read")
 
     def test_no_marker_for_standalone_file(self):
         audio = self.inbox / "plain.wav"
         audio.write_text("audio", encoding="utf-8")
         rc, seen = self._run([str(audio), "--date", "2026-11-18"])
         self.assertEqual(rc, 0)
-        self.assertIsNone(seen["beacon_at_call"])
+        self.assertFalse(seen["marker_at_call"])
         self.assertEqual(list(self.inbox.glob("*.pid")), [],
                          "standalone runs never write markers")
 

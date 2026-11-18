@@ -172,6 +172,9 @@ def write_summary(data: dict, asr: dict, path: Path, title: str,
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+_CLAIM_MARKER_FD: int | None = None
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Transcribe a meeting recording and extract priorities, calendar events, and communication insights.")
     ap.add_argument("audio", nargs="?", help="audio file (wav/mp3/m4a/ogg/opus); omit when using --resume")
@@ -231,22 +234,44 @@ def main() -> int:
         if not args.audio:
             ap.error("an audio file is required (or use --resume OUT_DIR)")
         audio = Path(args.audio)
-        # Ownership-first (watcher runs only): publish our PID next to the
-        # claimed recording BEFORE touching it, so a replacement watcher can
-        # recognize this recording as owned. No marker yet = no owner yet = a
-        # recovering watcher may move the claim (we have not even opened the
-        # file). If we cannot publish the marker we refuse to start — an
-        # unrecognizable transcription must not consume the recording.
-        # Cleanup is the watcher's job (and the sweep's backstop); a leftover
-        # marker with a dead PID is harmless.
+        # Ownership-first (watcher runs only): claim the recording by taking
+        # the byte lock on its marker BEFORE touching it. Recovery must win
+        # the same lock before moving the claim, so the OS decides who owns
+        # the recording — there is no window between our claim and our first
+        # read. If the marker cannot be opened, locked, or written, we refuse
+        # to start: an unrecognizable transcription must not consume the
+        # recording. The lock (and fd) stay held for the whole run; the OS
+        # releases them when this process exits or crashes.
         if audio.name.endswith(".processing"):
-            beacon = audio.with_name(audio.name + ".pid")
+            global _CLAIM_MARKER_FD
+            marker = audio.with_name(audio.name + ".pid")
             try:
-                beacon.write_text(str(os.getpid()), encoding="utf-8")
+                fd = os.open(marker, os.O_RDWR | os.O_CREAT)
             except OSError as exc:
-                print(f"ERROR: cannot write the processing marker {beacon.name}: {exc} "
+                print(f"ERROR: cannot open the processing marker {marker.name}: {exc} "
                       f"— refusing to start so the recording stays safe.", file=sys.stderr)
                 return 1
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                os.close(fd)
+                print("ERROR: the processing marker is locked — a watcher is recovering "
+                      "this recording. Not starting.", file=sys.stderr)
+                return 1
+            try:
+                os.ftruncate(fd, 0)
+                os.write(fd, str(os.getpid()).encode("utf-8"))
+            except OSError as exc:
+                os.close(fd)
+                print(f"ERROR: cannot write our PID to the processing marker {marker.name}: "
+                      f"{exc} — refusing to start so the recording stays safe.", file=sys.stderr)
+                return 1
+            _CLAIM_MARKER_FD = fd  # held until process exit; kept for diagnostics/tests
         if not audio.exists():
             print(f"ERROR: file not found: {audio}", file=sys.stderr)
             return 1
