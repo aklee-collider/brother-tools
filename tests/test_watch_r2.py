@@ -76,19 +76,10 @@ def main() -> int:
     argv = sys.argv[1:]
     audio = Path(argv[0])
     out = Path(argv[argv.index("--out") + 1])
-    out.mkdir(parents=True, exist_ok=True)
-    # Mirror transcribe.py's contract: a missing recording = refuse, zero calls.
-    if not audio.exists():
-        print(f"ERROR: file not found: {audio}", flush=True)
-        return 1
-    call_log = os.environ.get("WATCH_CALL_LOG")
-    if call_log:
-        with open(call_log, "a", encoding="utf-8") as f:
-            f.write(f"{os.getpid()}\t{audio}\n")
     spec = spec_for(audio)
-    # Mirror transcribe.py's ownership contract: take the marker's byte lock
-    # BEFORE touching the recording and hold it until exit. PUBLISH_DELAY
-    # simulates interpreter startup (the pre-ownership window).
+    # Mirror transcribe.py's EXACT order — interpreter startup -> marker
+    # lock -> exists-check -> paid call. A delayed child whose claim was
+    # recovered while it slept must therefore refuse BEFORE logging a call.
     time.sleep(float(spec["PUBLISH_DELAY"]))
     if audio.name.endswith(".processing"):
         marker = audio.with_name(audio.name + ".pid")
@@ -104,9 +95,18 @@ def main() -> int:
             fcntl.lockf(mfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         os.ftruncate(mfd, 0)
         os.write(mfd, str(os.getpid()).encode())
-        # The marker is byte-locked (unreadable from outside by design) —
-        # publish our pid in the out dir so the test can drain us later.
+    if not audio.exists():
+        print(f"ERROR: file not found: {audio}", flush=True)
+        return 1
+    out.mkdir(parents=True, exist_ok=True)
+    # The marker is byte-locked (unreadable from outside by design) —
+    # publish our pid in the out dir so the test can drain us later.
+    if audio.name.endswith(".processing"):
         (out / "stub.pid").write_text(str(os.getpid()), encoding="utf-8")
+    call_log = os.environ.get("WATCH_CALL_LOG")
+    if call_log:
+        with open(call_log, "a", encoding="utf-8") as f:
+            f.write(f"{os.getpid()}\t{audio}\n")
     time.sleep(float(spec["SLEEP"]))
     (out / "transcript.txt").write_text("stub transcript for " + audio.name,
                                         encoding="utf-8")
@@ -376,7 +376,14 @@ class TestUniqueClaimPerAttempt(WatcherTestCase):
     """Review r5 finding: recovery moved recording A aside; recording B then
     arrived with the SAME filename. The delayed child for A must make ZERO
     transcription calls (its unique claim path stays gone) and B's child
-    exactly one."""
+    exactly one.
+
+    Red-on-baseline derivation: on dd98d4e the claim path is SHARED, and B's
+    child is delayed past A's wake-up — so when A wakes, the shared path
+    holds B's claimed bytes and B's child has not locked the marker yet.
+    The r4 marker lock cannot cover that window (nobody holds it): A's
+    exists-check passes on B's bytes and A calls too -> 2 calls -> red.
+    Unique claim paths close it: A's argv path stays gone -> refuse -> 0."""
 
     def test_recovered_a_then_b_same_name_old_child_zero_new_one_call(self):
         call_log = self.fx / "calls.log"
@@ -390,7 +397,6 @@ class TestUniqueClaimPerAttempt(WatcherTestCase):
         wait_until(lambda: list(inbox.glob("*.processing")),
                    STABLE_POLLS * POLL_SECS + 30,
                    "watcher to claim recording A")
-        a_claimed_at = time.time()
         a.kill()  # watcher crashes; delayed child A outlives it, un-started
         a.communicate(timeout=10)
 
@@ -398,17 +404,14 @@ class TestUniqueClaimPerAttempt(WatcherTestCase):
         wait_until(lambda: (inbox / "failed" / "meeting.m4a").exists(),
                    3 * POLL_SECS + 20, "recovery to move A's claim aside")
 
-        # Recording B: same filename, fast.
+        # Recording B: same filename; its child is delayed PAST A's wake-up,
+        # so at t=60 the shared path holds B and nobody holds the marker.
         (inbox / "meeting.m4a").write_bytes(b"B" * 100)
-        (inbox / "meeting.m4a.stubspec").write_text("", encoding="utf-8")
+        (inbox / "meeting.m4a.stubspec").write_text("PUBLISH_DELAY=90\n",
+                                                    encoding="utf-8")
         wait_until(lambda: (inbox / "processed" / "meeting.m4a").exists(),
-                   2 * (STABLE_POLLS * POLL_SECS) + 60,
-                   "B processed end to end")
-
-        # Release the delayed child: wait until its PUBLISH_DELAY has elapsed.
-        remaining = (a_claimed_at + 60 + 10) - time.time()  # spawn ≈ claim time
-        if remaining > 0:
-            time.sleep(remaining)
+                   2 * (STABLE_POLLS * POLL_SECS) + 120,
+                   "B processed end to end (its child sleeps 90s first)")
 
         calls = (call_log.read_text(encoding="utf-8").splitlines()
                  if call_log.exists() else [])
