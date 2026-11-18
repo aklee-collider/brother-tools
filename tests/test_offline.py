@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -135,10 +136,14 @@ class TestConversionIntegrity(unittest.TestCase):
             self.assertIn("incomplete conversion", str(ctx.exception))
 
 
-# ---------------------------------------------------------------- HIGH-2
+# ---------------------------------------------------------------- HIGH-2 (r2)
 class TestWatcherSingleInstance(unittest.TestCase):
-    """Review finding 2: a second watcher's startup sweep could move a
-    recording the first watcher was processing into failed/ (watch.py:84)."""
+    """Review r2 finding 2: two simultaneous starters could both take over a
+    stale lock (both read it as dead, then the loser's delete removed the
+    winner's FRESH lock). The lock is now an OS byte lock held for the
+    process lifetime: the OS decides atomically who holds it and releases it
+    by itself on exit or crash. These tests hold REAL byte locks from real
+    processes; lock-file CONTENTS are never load-bearing anymore."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -147,50 +152,82 @@ class TestWatcherSingleInstance(unittest.TestCase):
         watch.LOCK_FILE = self.dir / "watch.lock"
 
     def tearDown(self):
+        watch.release_lock()
         watch.LOCK_FILE = self.old_lock
         self.tmp.cleanup()
 
-    def _write_lock(self, pid: int) -> None:
-        watch.LOCK_FILE.write_text(
-            json.dumps({"pid": pid, "started": "2026-11-17T10:00:00"}), encoding="utf-8")
+    def _holder(self):
+        """A real second process holding the watch.lock byte for 60 s."""
+        return subprocess.Popen([sys.executable, "-c",
+            "import os, sys, time\n"
+            "f = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT)\n"
+            "if os.name == 'nt':\n"
+            "    import msvcrt; msvcrt.locking(f, msvcrt.LK_NBLCK, 1)\n"
+            "else:\n"
+            "    import fcntl; fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+            "print('HELD', flush=True)\n"
+            "time.sleep(60)\n", str(watch.LOCK_FILE)],
+            stdout=subprocess.PIPE, text=True)
 
-    def test_neg_second_watcher_refused_while_first_alive(self):
-        # Live PID = a real sleeping process we spawned.
-        sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
-        try:
-            self._write_lock(sleeper.pid)
+    def _try_acquire_until_refused(self) -> bool:
+        """acquire_lock() must fail once the holder really holds the byte.
+
+        The holder needs a moment to start; an early success just means the
+        byte was still free — release and retry."""
+        import time as _time
+        deadline = _time.time() + 10
+        while _time.time() < deadline:
             with mock.patch.object(watch, "log"):
-                self.assertFalse(watch.acquire_lock(),
-                                 "a second watcher must refuse to start")
-            self.assertTrue(watch.LOCK_FILE.exists(), "the live lock must survive refusal")
-        finally:
-            sleeper.kill()
-            sleeper.wait()
+                if not watch.acquire_lock():
+                    return True
+            watch.release_lock()
+            _time.sleep(0.1)
+        return False
 
-    def test_pos_stale_lock_taken_over(self):
-        # Just-outside edge: PID whose process has already exited.
+    def test_neg_second_watcher_refused_while_byte_held(self):
+        holder = self._holder()
+        try:
+            self.assertEqual(holder.stdout.readline().strip(), "HELD")
+            self.assertTrue(self._try_acquire_until_refused(),
+                            "a second watcher must refuse while the byte is held")
+            self.assertTrue(watch.LOCK_FILE.exists(), "the lock must survive the refusal")
+        finally:
+            holder.kill()
+            holder.wait()
+        # crash-release: the OS frees the byte the moment the holder dies —
+        # this is what replaces r1's stale-lock takeover (and its race).
+        with mock.patch.object(watch, "log"):
+            self.assertTrue(watch.acquire_lock(),
+                            "a replacement must acquire after the holder exits")
+        watch.release_lock()
+        self.assertFalse(watch.LOCK_FILE.exists(), "a clean exit tidies the file up")
+
+    def test_pos_leftover_lock_file_never_blocks(self):
+        # Edge: a leftover file with a DEAD pid note (crashed watcher). Under
+        # r1 this needed PID-liveness "takeover" — the code that raced. Now
+        # the file is just a note; a free byte means free to start.
         dead = subprocess.Popen([sys.executable, "-c", "pass"])
         dead.wait()
-        self._write_lock(dead.pid)
+        watch.LOCK_FILE.write_text(
+            json.dumps({"pid": dead.pid, "started": "2026-11-18T00:00:00"}), encoding="utf-8")
         with mock.patch.object(watch, "log"):
-            self.assertTrue(watch.acquire_lock(), "a dead holder's lock must be taken over")
+            self.assertTrue(watch.acquire_lock())
         watch.release_lock()
-        self.assertFalse(watch.LOCK_FILE.exists())
 
-    def test_pos_corrupt_lock_is_treated_as_stale(self):
+    def test_pos_corrupt_lock_file_never_blocks(self):
         # Birth shape: a half-written lock from a crash mid-write.
         watch.LOCK_FILE.write_text("{broken json", encoding="utf-8")
         with mock.patch.object(watch, "log"):
             self.assertTrue(watch.acquire_lock())
         watch.release_lock()
 
-    def test_neg_recover_stale_documented_as_lock_guarded(self):
-        # The defect mechanism, kept explicit: recover_stale() must stay
+    def test_neg_sweep_documented_as_lock_guarded(self):
+        # The defect mechanism, kept explicit: the claim sweep must stay
         # unreachable while a lock is held — main() wires acquire before it.
         import inspect
         src = inspect.getsource(watch.main)
-        self.assertLess(src.index("acquire_lock"), src.index("recover_stale"),
-                        "recover_stale() must only run after the lock is held")
+        self.assertLess(src.index("acquire_lock"), src.index("sweep_claims"),
+                        "sweep_claims() must only run after the lock is held")
 
 
 # ---------------------------------------------------------------- MED-3
@@ -492,6 +529,165 @@ class TestMeetingDateVisibility(unittest.TestCase):
             summary = (out / "summary.md").read_text(encoding="utf-8")
             self.assertIn("--date YYYY-MM-DD", summary,
                           "the today-default must say how to correct it")
+
+
+# ---------------------------------------------------------------- C2 (r2)
+class TestClaimSweep(unittest.TestCase):
+    """Review r2 condition 2: a transcribe child can outlive its crashed
+    watcher on Windows, so a .processing claim with a LIVE child pid must
+    never be moved — the sweep re-checks every poll instead."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.inbox = self.root / "inbox"
+        self.failed = self.root / "failed"
+        self.inbox.mkdir()
+        self.failed.mkdir()  # production main() creates these before any sweep
+        self.old_inbox, self.old_failed = watch.INBOX, watch.FAILED
+        watch.INBOX, watch.FAILED = self.inbox, self.failed
+        self.old_announced = set(watch._ANNOUNCED_ALIVE)
+        watch._ANNOUNCED_ALIVE.clear()
+
+    def tearDown(self):
+        watch.INBOX, watch.FAILED = self.old_inbox, self.old_failed
+        watch._ANNOUNCED_ALIVE.clear()
+        watch._ANNOUNCED_ALIVE.update(self.old_announced)
+        self.tmp.cleanup()
+
+    def test_neg_live_child_claim_left_alone(self):
+        # The r2 defect class: moving this claim would break a transcription
+        # that is still running (its watcher crashed mid-job).
+        sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        try:
+            claim = self.inbox / "meet.m4a.processing"
+            claim.write_text("audio", encoding="utf-8")
+            watch._pid_file(claim).write_text(str(sleeper.pid), encoding="utf-8")
+            with mock.patch.object(watch, "log"):
+                watch.sweep_claims()
+            self.assertTrue(claim.exists(), "a live child's claim must not be moved")
+            self.assertEqual(list(self.failed.iterdir()), [])
+        finally:
+            sleeper.kill()
+            sleeper.wait()
+
+    def test_pos_dead_child_claim_recovered(self):
+        # Just-outside edge: the beacon pid is real but the process exited.
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        claim = self.inbox / "meet.m4a.processing"
+        claim.write_text("audio", encoding="utf-8")
+        watch._pid_file(claim).write_text(str(dead.pid), encoding="utf-8")
+        with mock.patch.object(watch, "log"):
+            watch.sweep_claims()
+        self.assertFalse(claim.exists())
+        self.assertTrue((self.failed / "meet.m4a").exists())
+        self.assertFalse(watch._pid_file(claim).exists(), "the pid marker goes with the claim")
+
+    def test_pos_ownerless_claim_recovered(self):
+        # Birth shape: a claim left by a crash between spawn and beacon write.
+        claim = self.inbox / "meet.m4a.processing"
+        claim.write_text("audio", encoding="utf-8")
+        with mock.patch.object(watch, "log"):
+            watch.sweep_claims()
+        self.assertTrue((self.failed / "meet.m4a").exists())
+
+
+# ---------------------------------------------------------------- C3 (r2)
+class TestCompletenessNote(unittest.TestCase):
+    """Review r2 finding 3 / condition 3: the empty-segment warning must be
+    durable — read structurally from asr_meta.json, never swallowed with the
+    child's captured output, and unreadable metadata must say so."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.out = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _meta(self, **kw):
+        (self.out / "asr_meta.json").write_text(json.dumps(kw), encoding="utf-8")
+
+    def test_warning_on_empty_segments(self):
+        self._meta(segments=5, segments_empty=2)
+        note = watch._completeness_note(self.out)
+        self.assertIn("WARNING", note)
+        self.assertIn("2 of 5", note)
+
+    def test_plain_done_when_zero_empty(self):
+        self._meta(segments=5, segments_empty=0)
+        self.assertEqual(watch._completeness_note(self.out), "")
+
+    def test_missing_meta_names_itself(self):
+        self.assertIn("not found", watch._completeness_note(self.out))
+        self.assertIn("cannot verify", watch._completeness_note(self.out))
+
+    def test_malformed_meta_names_itself(self):
+        (self.out / "asr_meta.json").write_text("{not json", encoding="utf-8")
+        self.assertIn("cannot verify", watch._completeness_note(self.out))
+
+    def test_non_dict_meta_names_itself(self):
+        (self.out / "asr_meta.json").write_text("[1, 2]", encoding="utf-8")
+        self.assertIn("unexpected shape", watch._completeness_note(self.out))
+
+    def test_non_numeric_counts_name_themselves(self):
+        self._meta(segments="abc", segments_empty=None)
+        self.assertIn("non-numeric", watch._completeness_note(self.out))
+
+
+# ---------------------------------------------------------------- r2 finding 1
+class TestCmdFilesNoLiveParensInBlocks(unittest.TestCase):
+    """Review r2 finding 1 (class-level guard): inside a parenthesized cmd
+    block, an unescaped ( or ) in an echo line closes the block early —
+    setup.cmd:47/48/53 aborted first-time setup with 'was unexpected'.
+    Escaped ^(^) is required inside blocks; top-level echoes may keep parens."""
+
+    @staticmethod
+    def _live(text: str) -> str:
+        """Strip cmd escapes: ^x is literal x, never structural."""
+        out, i = [], 0
+        while i < len(text):
+            if text[i] == "^" and i + 1 < len(text):
+                i += 2
+                continue
+            out.append(text[i])
+            i += 1
+        return "".join(out)
+
+    @classmethod
+    def _violations(cls, text: str):
+        bad, depth = [], 0
+        for no, line in enumerate(text.splitlines(), 1):
+            live = cls._live(line)
+            if depth > 0 and re.match(r"\s*echo\b", line, re.I):
+                if "(" in live or ")" in live:
+                    bad.append((no, line.strip()))
+                    continue  # file is already broken; depth no longer trusted
+            depth += live.count("(") - live.count(")")
+            depth = max(depth, 0)
+        return bad
+
+    def _cmd_files(self):
+        return sorted(set(ROOT.rglob("*.cmd")))
+
+    def test_all_cmd_files_have_no_live_parens_inside_blocks(self):
+        problems = []
+        for f in self._cmd_files():
+            for no, line in self._violations(f.read_text(encoding="utf-8")):
+                problems.append(f"{f.name}:{no}: {line}")
+        self.assertEqual(problems, [], "unescaped parens in echo inside cmd blocks")
+
+    def test_neg_checker_catches_synthetic_violation(self):
+        # Negative control for the checker itself: the exact broken shape.
+        bad = "@echo off\nif not exist x (\n    echo key (optional; note).\n)\necho after\n"
+        found = self._violations(bad)
+        self.assertEqual(len(found), 1, "the checker must flag the broken shape")
+        self.assertIn("(optional", found[0][1])
+
+    def test_checker_accepts_escaped_shape(self):
+        good = "@echo off\nif not exist x (\n    echo key ^(optional; note^).\n)\necho after\n"
+        self.assertEqual(self._violations(good), [])
 
 
 if __name__ == "__main__":

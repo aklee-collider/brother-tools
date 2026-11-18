@@ -138,7 +138,11 @@ corrected date also lands in the calendar file.
   `output\`; fix the DeepSeek key and resume with
   `python transcribe.py --resume output\<folder>` (no transcription cost).
 - `A watcher is already running` → exactly that. One watcher does all the
-  work; if you're sure none is running (e.g. after a reboot), delete
-  `watch.lock` in this folder and start again.
+  work; if that copy is actually gone (crash, reboot), the lock releases by
+  itself — just start `watch.cmd` again. No file needs deleting.
+- A recording is stuck in `inbox\` as `<name>.processing` → a transcription
+  from an earlier crashed watcher may still be running for it; the watcher
+  checks every poll and moves it to `inbox\failed\` for a re-drop once that
+  transcription is really finished. Nothing for you to do by hand.
 - Watcher put a file in `inbox\failed\` → the log (`output\watch.log`) says
   why; fix it and drop the file back into `inbox\` to retry.
