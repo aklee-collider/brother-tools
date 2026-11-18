@@ -28,7 +28,6 @@ import argparse
 import hashlib
 import json
 import os
-import re
 import sys
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -175,21 +174,12 @@ def write_summary(data: dict, asr: dict, path: Path, title: str,
 
 _CLAIM_MARKER_FD: int | None = None
 
-_ATTEMPT_TAG = re.compile(r"\.\d{8}-\d{6}-\d{6}$")  # watch._claim_path's tag
 
-
-def _display_name(claim_name: str) -> str:
-    """The original filename for display: strip the watcher's attempt tag.
-
-    Mirrors watch._original_name — the watcher gives us a unique claim path
-    (e.g. meeting.m4a.20261118-170001-123456.processing) so a delayed child
-    can never be re-attached to a newer recording; users only ever see
-    meeting.m4a. (Duplicated here because the watcher is stdlib-only and
-    must not import this package's dependencies.)
-    """
-    base = (claim_name[:-len(".processing")]
+def _legacy_display(claim_name: str) -> str:
+    """Display fallback for claims that predate the marker note: the original
+    filename was the claim name itself (<name>.processing)."""
+    return (claim_name[:-len(".processing")]
             if claim_name.endswith(".processing") else claim_name)
-    return _ATTEMPT_TAG.sub("", base)
 
 
 def main() -> int:
@@ -259,6 +249,7 @@ def main() -> int:
         # to start: an unrecognizable transcription must not consume the
         # recording. The lock (and fd) stay held for the whole run; the OS
         # releases them when this process exits or crashes.
+        display: str | None = None
         if audio.name.endswith(".processing"):
             global _CLAIM_MARKER_FD
             marker = audio.with_name(audio.name + ".pid")
@@ -280,9 +271,25 @@ def main() -> int:
                 print("ERROR: the processing marker is locked — a watcher is recovering "
                       "this recording. Not starting.", file=sys.stderr)
                 return 1
+            # Merge our PID into the note WITHOUT losing what the watcher
+            # recorded there (the ORIGINAL filename recovery displays). The
+            # read/rewrite goes through our own locked fd, which the OS
+            # permits for the locking process.
             try:
+                os.lseek(fd, 0, 0)
+                try:
+                    note = json.loads(os.read(fd, 65536).decode("utf-8", errors="replace"))
+                except ValueError:
+                    note = {}
+                if not isinstance(note, dict):
+                    note = {}
+                note["pid"] = os.getpid()
+                os.lseek(fd, 0, 0)
                 os.ftruncate(fd, 0)
-                os.write(fd, str(os.getpid()).encode("utf-8"))
+                os.write(fd, json.dumps(note).encode("utf-8"))
+                original = note.get("original")
+                display = (original if isinstance(original, str) and original
+                           else _legacy_display(audio.name))
             except OSError as exc:
                 os.close(fd)
                 print(f"ERROR: cannot write our PID to the processing marker {marker.name}: "
@@ -300,7 +307,7 @@ def main() -> int:
             date_note = ""
         else:
             date_note = ("today — if the meeting was earlier, re-run with --date YYYY-MM-DD")
-        title = Path(_display_name(audio.name)).stem
+        title = Path(display).stem if display else audio.stem
 
         out_dir = Path(args.out) if args.out else HERE / "output" / f"{audio.stem}_{datetime.now():%Y%m%d-%H%M%S}"
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -314,7 +321,7 @@ def main() -> int:
         (out_dir / "transcript.txt").write_text(asr["transcript"], encoding="utf-8")
         (out_dir / "asr_meta.json").write_text(json.dumps({
             "title": title,
-            "audio": _display_name(audio.name),
+            "audio": display or audio.name,
             "meeting_day": meeting_day,
             "date_note": date_note,
             "duration_s": asr["duration_s"],

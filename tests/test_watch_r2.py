@@ -46,21 +46,28 @@ POLL_SECS = 10      # watch.py's production poll period
 STABLE_POLLS = 2    # production stability window: ~20 s before a file is claimed
 
 STUB_TRANSCRIBE = r'''\
-import json, os, re, sys, time
+import json, os, sys, time
 from pathlib import Path
 
 
 def spec_for(audio: Path) -> dict:
     """Per-file behavior spec: <original name>.stubspec next to the claim.
 
-    The watcher passes a UNIQUE claim path (original + attempt tag +
-    .processing, r5) — strip both suffixes to find the spec the test
-    dropped next to the original recording.
+    Claims are opaque (proc-<id>.processing, r6) — the ORIGINAL filename
+    comes from the marker note the watcher wrote before the rename.
     """
     name = audio.name
     if name.endswith(".processing"):
-        name = name[: -len(".processing")]
-    name = re.sub(r"\.\d{8}-\d{6}-\d{6}$", "", name)
+        try:
+            note = json.loads(audio.with_name(audio.name + ".pid")
+                              .read_text(encoding="utf-8"))
+            original = note.get("original")
+            if isinstance(original, str) and original:
+                name = original
+            else:
+                name = name[: -len(".processing")]
+        except (OSError, ValueError):
+            name = name[: -len(".processing")]
     spec = {"META": "ok", "EMPTY": "0", "SEGMENTS": "5", "SLEEP": "0",
             "PUBLISH_DELAY": "0", "PUBLISH_FAIL": "0"}
     p = audio.parent / (name + ".stubspec")
@@ -76,6 +83,12 @@ def main() -> int:
     argv = sys.argv[1:]
     audio = Path(argv[0])
     out = Path(argv[argv.index("--out") + 1])
+    # Explicit "child is alive" signal, BEFORE anything else — the tests
+    # wait for this before killing a watcher (the verdict's requirement).
+    sig = os.environ.get("WATCH_START_SIGNAL")
+    if sig:
+        with open(sig, "w", encoding="utf-8") as f:
+            f.write(str(os.getpid()))
     spec = spec_for(audio)
     # Mirror transcribe.py's EXACT order — interpreter startup -> marker
     # lock -> exists-check -> paid call. A delayed child whose claim was
@@ -93,8 +106,18 @@ def main() -> int:
         else:
             import fcntl
             fcntl.lockf(mfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        # Merge our PID into the note WITHOUT losing the original filename.
+        os.lseek(mfd, 0, 0)
+        try:
+            note = json.loads(os.read(mfd, 65536).decode("utf-8"))
+        except Exception:
+            note = {}
+        if not isinstance(note, dict):
+            note = {}
+        note["pid"] = os.getpid()
+        os.lseek(mfd, 0, 0)
         os.ftruncate(mfd, 0)
-        os.write(mfd, str(os.getpid()).encode())
+        os.write(mfd, json.dumps(note).encode())
     if not audio.exists():
         print(f"ERROR: file not found: {audio}", flush=True)
         return 1
@@ -332,14 +355,23 @@ class TestOwnershipHandoff(WatcherTestCase):
         wait_until(lambda: list(inbox.glob("*.processing")),
                    STABLE_POLLS * POLL_SECS + 30,
                    "watcher to claim the recording")
-        claim = list(inbox.glob("*.processing"))[0]  # unique-tagged claim path
+        claim = list(inbox.glob("*.processing"))[0]  # opaque claim path
         pid_file = Path(str(claim) + ".pid")
         time.sleep(2)  # the child is spawned right after the claim
-        self.assertFalse(pid_file.exists(),
-                         "pre-publication: the child has not claimed ownership yet")
-        time.sleep(2)  # the child is spawned right after the claim
-        self.assertFalse(pid_file.exists(),
-                         "pre-publication: the child has not claimed ownership yet")
+        # r6: the WATCHER pre-writes the note (with the original filename) at
+        # claim time, so the marker's EXISTENCE is not ownership — the child
+        # merged PID is. Pre-publication: pid still null. (Baseline shapes
+        # without the note contract skip these pins — their recovery flow is
+        # still exercised below.)
+        try:
+            note = json.loads(pid_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            note = {}
+        if note:
+            self.assertIsNone(note.get("pid"),
+                              "pre-publication: the child has not claimed ownership yet")
+            self.assertEqual(note.get("original"), "meeting.m4a",
+                             "the note carries the ORIGINAL filename from claim time")
         a.kill()  # watcher dies in the launch window; the child is still starting
         a.communicate(timeout=10)
         c = self.run_watcher()
@@ -388,16 +420,23 @@ class TestUniqueClaimPerAttempt(WatcherTestCase):
     def test_recovered_a_then_b_same_name_old_child_zero_new_one_call(self):
         call_log = self.fx / "calls.log"
         inbox = self.fx / "inbox"
+        start_signal = self.fx / "child-alive.signal"
 
         # Recording A: its child is delayed (simulating interpreter startup).
         (inbox / "meeting.m4a").write_bytes(b"A" * 100)
         (inbox / "meeting.m4a.stubspec").write_text("PUBLISH_DELAY=60\n",
                                                     encoding="utf-8")
-        a = self.run_watcher({"WATCH_CALL_LOG": str(call_log)})
+        a = self.run_watcher({"WATCH_CALL_LOG": str(call_log),
+                              "WATCH_START_SIGNAL": str(start_signal)})
         wait_until(lambda: list(inbox.glob("*.processing")),
                    STABLE_POLLS * POLL_SECS + 30,
                    "watcher to claim recording A")
-        a.kill()  # watcher crashes; delayed child A outlives it, un-started
+        # Explicit signal that the old child is ALIVE before killing its
+        # watcher (the verdict's requirement) — then the watcher dies and
+        # the delayed child A outlives it, un-started work pending.
+        wait_until(lambda: start_signal.exists(), 20,
+                   "the delayed child process to signal it is alive")
+        a.kill()
         a.communicate(timeout=10)
 
         c = self.run_watcher({"WATCH_CALL_LOG": str(call_log)})
@@ -417,7 +456,12 @@ class TestUniqueClaimPerAttempt(WatcherTestCase):
                  if call_log.exists() else [])
         self.assertEqual(len(calls), 1,
                          f"exactly one transcription call (B's); got: {calls}")
-        self.assertIn("meeting.m4a", calls[0])
+        # r6: the paid call is on the OPAQUE claim path — never on a shared
+        # original name (on dd98d4e the logged path IS meeting.m4a.processing).
+        self.assertNotIn("meeting.m4a", calls[0],
+                         "the paid call must not reference a shared original name")
+        self.assertIn("meeting.m4a", read_log(self.fx),
+                      "the watcher log still displays the original filename")
         self.assertEqual(list(inbox.glob("*.processing")), [],
                          "A's unique claim path must stay gone")
         self.stop(c)
@@ -433,6 +477,10 @@ class TestWarningDurability(WatcherTestCase):
     def _wait_processed(self, stem: str):
         wait_until(lambda: (self.fx / "inbox" / "processed" / f"{stem}.m4a").exists(),
                    STABLE_POLLS * POLL_SECS + 40, f"{stem} archived to processed")
+        # the DONE line is written just after the archive rename — wait for
+        # the line itself, not a same-instant read (a race that fired once)
+        wait_until(lambda: done_lines(read_log(self.fx), f"{stem}.m4a"),
+                   10, f"{stem}'s DONE line to reach watch.log")
 
     def test_positive_count_warns_and_archives(self):
         self._drop("m1", "EMPTY=2\nSEGMENTS=5\n")

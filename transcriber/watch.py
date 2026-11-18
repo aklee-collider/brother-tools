@@ -20,21 +20,27 @@ Two safety mechanisms, both OS-level so they survive crashes:
   in place forever (deleting it would be racy on Unix — a replacement could
   lock the old file while a third process creates a fresh one); its content
   is just a note for the refusal message.
-- Claim safety: while a recording is being processed it is renamed to
-  <name>.processing, and ownership of the claim is decided by ONE atomic
-  thing: the byte lock on the marker file (<name>.processing.pid). The
-  transcribe.py child takes that lock as its first act — before opening the
-  recording — and holds it for its whole run. Recovery must win the same
-  lock before it may move the claim, so claiming and recovering cannot
-  overlap: whoever loses the lock attempt loses atomically, and the OS
-  releases the lock when a process exits or crashes.
+- Claim safety: while a recording is being processed it is renamed to a
+  unique, clock-independent claim path (proc-<id>.processing — the id is
+  crypto-random, so a clock step, NTP adjustment, or repeated clock reading
+  can never hand a delayed child a path a NEWER recording is using). The
+  ORIGINAL filename travels in the marker note (<claim>.pid), written
+  BEFORE the rename: recovery and the transcript keep the real name, and
+  the working-file names stay short no matter how long the recording's
+  name is. Ownership of the claim is decided by ONE atomic thing: the byte
+  lock on the marker file. The transcribe.py child takes that lock as its
+  first act (before opening the recording) and holds it for its whole run;
+  recovery must win the same lock before it may move the claim, so
+  claiming and recovering cannot overlap: whoever loses the lock attempt
+  loses atomically, and the OS releases the lock when a process exits or
+  crashes.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import re
+import secrets
 import subprocess
 import sys
 import time
@@ -74,28 +80,39 @@ def _dest(folder: Path, name: str) -> Path:
     return dest
 
 
-_ATTEMPT_TAG = r"\d{8}-\d{6}-\d{6}"  # YYYYmmdd-HHMMSS-ffffff, matches _claim_path
-
-
 def _claim_path(path: Path) -> Path:
-    """A unique claim path per processing attempt: <name>.<tag>.processing.
+    """A unique, clock-independent claim path: proc-<id>.processing.
 
-    Uniqueness is what keeps a delayed child (its watcher crashed, recovery
-    moved the claim) from ever being re-attached to a NEWER recording with
-    the same filename — its argv points at a path that stays gone. The tag
-    is stripped for display everywhere the original filename matters.
+    The id is crypto-random (secrets), NOT the wall clock: clock steps, NTP
+    adjustments, or two starts inside one clock tick can repeat a timestamp
+    reading, and a repeated reading would re-attach a delayed child to a
+    NEWER recording with the same filename (duplicate paid call, wrong
+    contents). The original filename travels in the marker note (written
+    before the rename), so working-file names stay short no matter how long
+    the recording's name is — the lock marker must fit Windows' 255-char
+    filename limit for ANY recording.
     """
-    tag = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-    return path.with_name(f"{path.name}.{tag}.processing")
+    return path.with_name(f"proc-{secrets.token_hex(6)}.processing")
 
 
-def _original_name(claim_name: str) -> str:
-    """The display filename for a claim path (inverse of _claim_path)."""
-    base = claim_name[: -len(".processing")]
-    parts = base.rsplit(".", 1)
-    if len(parts) == 2 and re.fullmatch(_ATTEMPT_TAG, parts[1]):
-        return parts[0]
-    return base  # claims from older versions carry no tag
+def _original_name(claim: Path, marker: Path) -> str:
+    """The recording's original filename, for display and recovery.
+
+    Stored in the marker note when the claim is made; falls back to the
+    claim name itself for legacy claims that carried the name directly
+    (<name>.processing). Best effort while a live child holds the marker
+    (its byte lock blocks other processes' reads): the announce line falls
+    back to the opaque claim name there — recovery re-reads it once the
+    lock is free.
+    """
+    try:
+        data = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = {}
+    original = data.get("original") if isinstance(data, dict) else None
+    if isinstance(original, str) and original:
+        return original
+    return claim.name[: -len(".processing")]
 
 
 # --------------------------------------------------------------- pid beacon
@@ -106,9 +123,11 @@ def _pid_file(claimed: Path) -> Path:
 
 def _read_pid_file(pid_file: Path) -> int | None:
     try:
-        return int(pid_file.read_text(encoding="utf-8").strip())
+        data = json.loads(pid_file.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
+    pid = data.get("pid") if isinstance(data, dict) else None
+    return pid if isinstance(pid, int) else None
 
 
 def _clear_pid_file(pid_file: Path) -> None:
@@ -246,32 +265,41 @@ def _completeness_note(out_dir: Path) -> str:
 
 
 def process_one(path: Path) -> bool:
-    claimed = _claim_path(path)  # unique per attempt: a delayed child from a
-    try:                         # crashed run can never be re-attached to a
-        os.rename(path, claimed)  # newer recording with the same filename
+    claim = _claim_path(path)
+    marker = _pid_file(claim)
+    # The note (carrying the ORIGINAL filename) is written BEFORE the rename:
+    # a crash can then never leave a claim whose original name is lost, and
+    # a failed note write refuses the claim instead of degrading recovery.
+    try:
+        marker.write_text(json.dumps({"pid": None, "original": path.name}),
+                          encoding="utf-8")
+    except OSError as exc:
+        log(f"SKIP {path.name}: cannot write the claim note ({exc}) — will retry.")
+        return False
+    try:
+        os.rename(path, claim)  # atomic claim: a second watcher won't see it
     except OSError as exc:
         log(f"SKIP {path.name}: still locked by the sync app ({exc})")
+        _clear_pid_file(marker)  # tidy the pre-written note
         return False
-    meeting_day = datetime.fromtimestamp(claimed.stat().st_mtime).date().isoformat()
+    meeting_day = datetime.fromtimestamp(claim.stat().st_mtime).date().isoformat()
     out_dir = HERE / "output" / f"{path.stem}_{datetime.now():%Y%m%d-%H%M%S}"
     log(f"PROCESS {path.name} (meeting date {meeting_day})")
     try:
         proc = subprocess.Popen(
-            [sys.executable, str(HERE / "transcribe.py"), str(claimed),
+            [sys.executable, str(HERE / "transcribe.py"), str(claim),
              "--date", meeting_day, "--date-assumed", "--out", str(out_dir)],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
     except OSError as exc:
         log(f"FAILED {path.name}: cannot launch transcribe.py ({exc})")
-        os.rename(claimed, _dest(FAILED, path.name))
+        os.rename(claim, _dest(FAILED, path.name))
+        _clear_pid_file(marker)
         return False
-    # Ownership beacon: the CHILD publishes its own PID as its first act
-    # (before it opens the recording), so between spawn and publication it
-    # has not touched the file — a watcher lost in that window leaves a
-    # claim that recovery safely moves. This watcher only clears the marker
-    # once the child is done (a hard kill on timeout skips the child's own
-    # cleanup).
-    pid_file = _pid_file(claimed)
+    # Ownership beacon: the CHILD takes the marker's byte lock as its first
+    # act (before it opens the recording) and merges its PID into the note.
+    # This watcher only clears the note once the child is done (a hard kill
+    # on timeout skips the child's own cleanup).
     timed_out = False
     try:
         out, err = proc.communicate(timeout=PROCESS_TIMEOUT)
@@ -279,9 +307,9 @@ def process_one(path: Path) -> bool:
         timed_out = True
         proc.kill()
         proc.communicate()
-    _clear_pid_file(pid_file)  # child is done (or killed) — beacon served
+    _clear_pid_file(marker)  # child is done (or killed) — beacon served
     if not timed_out and proc.returncode == 0:
-        os.rename(claimed, _dest(PROCESSED, path.name))
+        os.rename(claim, _dest(PROCESSED, path.name))
         try:
             note = _completeness_note(out_dir)
         except Exception as exc:  # a note must never kill the watch loop
@@ -290,7 +318,7 @@ def process_one(path: Path) -> bool:
         return True
     if timed_out:
         err = f"timeout after {PROCESS_TIMEOUT}s"
-    os.rename(claimed, _dest(FAILED, path.name))
+    os.rename(claim, _dest(FAILED, path.name))
     log(f"FAILED {path.name}: {(err or '').strip()[-300:]}")
     return False
 
@@ -308,10 +336,10 @@ def sweep_claims() -> None:
     - Marker locked (a live transcription, e.g. a crashed watcher's orphan
       child): leave the claim alone, announce it once, re-check every poll.
     - Marker free or missing: nobody owns the recording. The sweep creates
-      the marker itself if needed, moves the claim to failed/ (a re-drop
-      retries it), releases the lock, then tidies the marker. A child that
-      arrives after the move finds no recording and exits before
-      transcribing anything.
+      the marker itself if needed, moves the claim to failed/ under its
+      ORIGINAL filename (from the marker note), releases the lock, then
+      tidies the marker. A child that arrives after the move finds no
+      recording and exits before transcribing anything.
     Stray markers whose claim is already gone are tidied up.
     """
     for stray in INBOX.glob("*.processing.pid"):
@@ -321,8 +349,8 @@ def sweep_claims() -> None:
             log(f"Removed a stray pid marker without a claim: {stray.name}")
     for stale in INBOX.glob("*.processing"):
         marker = _pid_file(stale)
-        display = _original_name(stale.name)
-        owner_note = _read_pid_file(marker)  # best-effort, for the log only
+        display = _original_name(stale, marker)  # best-effort; see its notes
+        owner_note = _read_pid_file(marker)
         try:
             fd = os.open(marker, os.O_RDWR | os.O_CREAT)  # tombstone if absent
         except OSError as exc:

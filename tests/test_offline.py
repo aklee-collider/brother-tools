@@ -20,6 +20,7 @@ import tempfile
 import unittest
 import wave
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
@@ -667,57 +668,89 @@ class TestClaimSweep(unittest.TestCase):
         self.assertFalse(marker.exists())
         self.assertEqual(list(self.failed.iterdir()), [])
 
+    def test_pos_recovery_uses_the_original_from_the_note(self):
+        # r6 P3: an opaque claim recovers under its ORIGINAL filename — even
+        # a 220-character one (which could never fit a tagged claim name).
+        long_name = "r" * 220 + ".m4a"
+        claim = self.inbox / "proc-abc123def456.processing"
+        claim.write_text("audio", encoding="utf-8")
+        marker = watch._pid_file(claim)
+        marker.write_text(json.dumps({"pid": None, "original": long_name}),
+                          encoding="utf-8")
+        self.assertLessEqual(len(marker.name), 255)
+        with mock.patch.object(watch, "log"):
+            watch.sweep_claims()
+        self.assertFalse(claim.exists())
+        self.assertTrue((self.failed / long_name).exists(),
+                        "recovery must restore the ORIGINAL filename from the note")
+        self.assertFalse(marker.exists())
 
-# ---------------------------------------------------------------- r5
+
+# ---------------------------------------------------------------- r6
 class TestClaimNaming(unittest.TestCase):
-    """Review r5 finding: the claim path used to be reused across attempts,
-    so a delayed child from a crashed run could be re-attached to a NEWER
-    recording with the same filename (duplicate paid calls, wrong contents).
-    Each attempt now gets a unique claim path; display keeps the original."""
+    """Review r6 findings: the claim id must NOT depend on the clock (a
+    repeated clock reading — NTP step, coarse tick — re-attached a delayed
+    child to a newer recording), and the working-file names must stay short
+    no matter how long the recording's name is (the lock marker must fit
+    Windows' 255-character filename limit)."""
 
-    def test_claim_paths_unique_per_attempt(self):
-        import time as _time
-        p1 = watch._claim_path(Path("meeting.m4a"))
-        _time.sleep(0.0001)  # attempts are poll-cycles apart; force a tag change
-        p2 = watch._claim_path(Path("meeting.m4a"))
-        self.assertNotEqual(p1.name, p2.name, "two attempts must not share a claim")
-        for p in (p1, p2):
-            self.assertTrue(p.name.endswith(".processing"))
-            self.assertEqual(watch._original_name(p.name), "meeting.m4a",
-                             "display must recover the original filename")
+    def test_claim_unique_under_a_frozen_clock(self):
+        # Freeze the clock completely: claims made "at the same reading"
+        # must still differ — the id is secrets-based, not time-based.
+        frozen = mock.MagicMock()
+        frozen.now.return_value = datetime(2026, 11, 19, 8, 0, 0)
+        with mock.patch.object(watch, "datetime", frozen):
+            names = {watch._claim_path(Path("meeting.m4a")).name
+                     for _ in range(200)}
+        self.assertEqual(len(names), 200,
+                         "claims must be unique even when the clock never moves")
 
-    def test_original_name_parses_legacy_and_plain_shapes(self):
-        # Legacy claims from before r5 carried no tag; the parse must not eat
-        # real filename segments.
-        self.assertEqual(watch._original_name("meeting.m4a.processing"), "meeting.m4a")
-        self.assertEqual(
-            watch._original_name("meeting.m4a.20261118-170830-086027.processing"),
-            "meeting.m4a")
-        self.assertEqual(watch._original_name("meet.2026.11.18.m4a.processing"),
-                         "meet.2026.11.18.m4a", "dots in the real name must survive")
+    def test_claim_name_carries_no_original_and_fits_any_recording(self):
+        long_name = "r" * 220 + ".m4a"
+        claim = watch._claim_path(Path(long_name))
+        self.assertNotIn("meeting", watch._claim_path(Path("meeting.m4a")).name,
+                         "the working name must be an opaque id, not the recording")
+        self.assertLessEqual(len(watch._pid_file(claim).name), 255,
+                             "the lock marker must fit Windows' filename limit")
+
+    def test_original_name_from_marker_and_legacy_fallback(self):
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            claim = Path("proc-abc123def456.processing")
+            marker = d / "proc-abc123def456.processing.pid"
+            marker.write_text(json.dumps({"pid": 7, "original": "board-meeting.m4a"}),
+                              encoding="utf-8")
+            self.assertEqual(watch._original_name(claim, marker), "board-meeting.m4a")
+            # legacy shape: no note, the claim name carried the original
+            legacy = Path("board-meeting.m4a.processing")
+            self.assertEqual(watch._original_name(legacy, d / "absent.pid"),
+                             "board-meeting.m4a")
+            # unreadable note: fallback, never an exception
+            marker.write_text("{broken", encoding="utf-8")
+            self.assertEqual(watch._original_name(claim, marker),
+                             claim.name[: -len(".processing")])
 
 
-# ---------------------------------------------------------------- r5
+# ---------------------------------------------------------------- r5/r6
 class TestDelayedChildCantPickUpReplacement(unittest.TestCase):
-    """Review r5 finding, replayed as the forced overlap: a delayed child
-    starts, the shared filename fills with a NEW recording's bytes, the
-    child resumes. With unique claim paths the child's argv can never point
-    at another attempt's audio — its result stays its own recording. (This
-    test is RED against dd98d4e, where the claim path was reused.)"""
+    """Review r5/r6 finding, offline form: two attempts of the SAME filename
+    never share a claim path, each attempt's path is gone once it finishes
+    (renamed away — re-attachment impossible), the original filename travels
+    in the marker note, and each child's result is its own recording's bytes.
+    (RED on dd98d4e at harness level: two calls on one shared path.)"""
 
-    def test_delayed_child_transcribes_its_own_bytes(self):
+    def test_two_attempts_never_share_a_claim_or_bytes(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         root = Path(tmp.name)
         inbox, processed, failed = root / "inbox", root / "processed", root / "failed"
-        inbox.mkdir()
-        processed.mkdir()
-        failed.mkdir()  # production main() creates these before any processing
+        for d in (inbox, processed, failed):
+            d.mkdir()  # production main() creates these before any processing
         old = {"HERE": watch.HERE, "INBOX": watch.INBOX,
                "PROCESSED": watch.PROCESSED, "FAILED": watch.FAILED}
         watch.HERE, watch.INBOX = root, inbox
         watch.PROCESSED, watch.FAILED = processed, failed
-        seen = {}
+        seen = {"argvs": [], "notes": [], "bytes": []}
 
         class _FakeProc:
             pid = 424242
@@ -728,11 +761,13 @@ class TestDelayedChildCantPickUpReplacement(unittest.TestCase):
 
             def communicate(self, timeout=None):
                 claimed = Path(self.cmd[2])
-                seen["argv"] = str(claimed)
-                seen["bytes_at_child_start"] = claimed.read_bytes()
-                # the "release": a new recording fills the SHARED legacy name
-                # (inbox/meeting.m4a.processing) while the child is mid-flight
-                (inbox / "meeting.m4a.processing").write_bytes(b"B-CONTAMINATED!")
+                seen["argvs"].append(str(claimed))
+                try:
+                    seen["notes"].append(
+                        json.loads(Path(str(claimed) + ".pid").read_text(encoding="utf-8")))
+                except (OSError, ValueError):
+                    seen["notes"].append(None)
+                seen["bytes"].append(claimed.read_bytes())  # the child's recording
                 return ("", "")
 
             def kill(self):
@@ -744,16 +779,26 @@ class TestDelayedChildCantPickUpReplacement(unittest.TestCase):
             with mock.patch.object(watch, "log"), \
                  mock.patch.object(watch.subprocess, "Popen",
                                    side_effect=lambda cmd, **k: _FakeProc(cmd)):
-                rc = watch.process_one(source)
-            self.assertTrue(rc)
-            result = (processed / "meeting.m4a").read_bytes()
-            self.assertEqual(result, b"A-ORIGINAL",
-                             "the delayed child must transcribe ITS recording, "
-                             "not whichever bytes later filled a shared path")
-            self.assertNotEqual(seen["argv"], str(inbox / "meeting.m4a.processing"),
-                                "the claim path must be unique per attempt")
-            self.assertEqual(seen["bytes_at_child_start"], b"A-ORIGINAL",
-                             "the child started on its own recording's bytes")
+                self.assertTrue(watch.process_one(source))
+                argv_a = seen["argvs"][0]
+                self.assertNotIn("meeting", argv_a,
+                                 "the working name must be an opaque id")
+                self.assertEqual(seen["notes"][0],
+                                 {"pid": None, "original": "meeting.m4a"},
+                                 "the ORIGINAL filename must ride in the marker note")
+                self.assertEqual(seen["bytes"][0], b"A-ORIGINAL")
+                self.assertFalse(Path(argv_a).exists(),
+                                 "a finished attempt's claim path is gone — nothing to re-attach")
+
+                source.write_bytes(b"B-CONTENTS")
+                self.assertTrue(watch.process_one(source))
+            argv_b = seen["argvs"][1]
+            self.assertNotEqual(argv_b, argv_a,
+                                "two attempts of one filename must never share a claim")
+            self.assertEqual(seen["bytes"][1], b"B-CONTENTS")
+            processed_files = sorted(p.read_bytes() for p in processed.iterdir())
+            self.assertEqual(processed_files, [b"A-ORIGINAL", b"B-CONTENTS"],
+                             "each result must be its own recording's bytes")
         finally:
             watch.HERE, watch.INBOX = old["HERE"], old["INBOX"]
             watch.PROCESSED, watch.FAILED = old["PROCESSED"], old["FAILED"]
@@ -879,6 +924,44 @@ class TestTranscribeClaimBeacon(unittest.TestCase):
         self.assertFalse(seen["marker_at_call"])
         self.assertEqual(list(self.inbox.glob("*.pid")), [],
                          "standalone runs never write markers")
+
+    def _display_check(self, original: str):
+        claim = self.inbox / "proc-abc123def456.processing"
+        claim.write_text("audio", encoding="utf-8")
+        marker = self.inbox / "proc-abc123def456.processing.pid"
+        marker.write_text(json.dumps({"pid": None, "original": original}),
+                          encoding="utf-8")
+        rc, seen = self._run([str(claim), "--date", "2026-11-18"])
+        self.assertEqual(rc, 0)
+        meta = json.loads((self.inbox / "out" / "asr_meta.json").read_text(encoding="utf-8"))
+        self.assertEqual(meta["audio"], original,
+                         "display must use the ORIGINAL from the marker note")
+        self.assertEqual(meta["meeting_day"], "2026-11-18")
+        # the child must PRESERVE the note's original while merging its pid;
+        # close the child's held fd first (same trick as process exit — the
+        # mandatory lock blocks other handles until then)
+        os.close(transcribe._CLAIM_MARKER_FD)
+        transcribe._CLAIM_MARKER_FD = None
+        note = json.loads(marker.read_text(encoding="utf-8"))
+        self.assertEqual(note["original"], original)
+        self.assertEqual(note["pid"], os.getpid())
+
+    def test_display_uses_the_original_from_the_marker_note(self):
+        self._display_check("Q3 board meeting.m4a")
+
+    def test_long_original_name_surfaces_intact(self):
+        # r6 P3: a 220-character original must survive display untouched —
+        # it never enters the working-file names at all.
+        self._display_check("r" * 220 + ".m4a")
+
+    def test_legacy_claim_display_falls_back_to_claim_name(self):
+        # A legacy claim (<name>.processing, no note) still displays right.
+        claim = self.inbox / "legacy-meeting.m4a.processing"
+        claim.write_text("audio", encoding="utf-8")
+        rc, seen = self._run([str(claim), "--date", "2026-11-18"])
+        self.assertEqual(rc, 0)
+        meta = json.loads((self.inbox / "out" / "asr_meta.json").read_text(encoding="utf-8"))
+        self.assertEqual(meta["audio"], "legacy-meeting.m4a")
 
 
 # ---------------------------------------------------------------- C3 (r2)
