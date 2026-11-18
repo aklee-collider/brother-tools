@@ -28,6 +28,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sys
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -174,6 +175,22 @@ def write_summary(data: dict, asr: dict, path: Path, title: str,
 
 _CLAIM_MARKER_FD: int | None = None
 
+_ATTEMPT_TAG = re.compile(r"\.\d{8}-\d{6}-\d{6}$")  # watch._claim_path's tag
+
+
+def _display_name(claim_name: str) -> str:
+    """The original filename for display: strip the watcher's attempt tag.
+
+    Mirrors watch._original_name — the watcher gives us a unique claim path
+    (e.g. meeting.m4a.20261118-170001-123456.processing) so a delayed child
+    can never be re-attached to a newer recording; users only ever see
+    meeting.m4a. (Duplicated here because the watcher is stdlib-only and
+    must not import this package's dependencies.)
+    """
+    base = (claim_name[:-len(".processing")]
+            if claim_name.endswith(".processing") else claim_name)
+    return _ATTEMPT_TAG.sub("", base)
+
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Transcribe a meeting recording and extract priorities, calendar events, and communication insights.")
@@ -283,7 +300,7 @@ def main() -> int:
             date_note = ""
         else:
             date_note = ("today — if the meeting was earlier, re-run with --date YYYY-MM-DD")
-        title = audio.stem
+        title = Path(_display_name(audio.name)).stem
 
         out_dir = Path(args.out) if args.out else HERE / "output" / f"{audio.stem}_{datetime.now():%Y%m%d-%H%M%S}"
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -297,7 +314,7 @@ def main() -> int:
         (out_dir / "transcript.txt").write_text(asr["transcript"], encoding="utf-8")
         (out_dir / "asr_meta.json").write_text(json.dumps({
             "title": title,
-            "audio": audio.name,
+            "audio": _display_name(audio.name),
             "meeting_day": meeting_day,
             "date_note": date_note,
             "duration_s": asr["duration_s"],

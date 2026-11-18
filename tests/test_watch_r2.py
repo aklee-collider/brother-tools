@@ -45,20 +45,22 @@ SOURCE = os.environ.get("BROTHER_WATCH_SOURCE", "WORKING")
 POLL_SECS = 10      # watch.py's production poll period
 STABLE_POLLS = 2    # production stability window: ~20 s before a file is claimed
 
-STUB_TRANSCRIBE = '''\
-import json, os, sys, time
+STUB_TRANSCRIBE = r'''\
+import json, os, re, sys, time
 from pathlib import Path
 
 
 def spec_for(audio: Path) -> dict:
-    """Per-file behavior spec: <audio name>.stubspec next to the claimed file.
+    """Per-file behavior spec: <original name>.stubspec next to the claim.
 
-    The watcher passes the CLAIMED name (audio ends in .processing), so the
-    suffix is stripped to find the spec the test dropped next to the original.
+    The watcher passes a UNIQUE claim path (original + attempt tag +
+    .processing, r5) — strip both suffixes to find the spec the test
+    dropped next to the original recording.
     """
     name = audio.name
     if name.endswith(".processing"):
         name = name[: -len(".processing")]
+    name = re.sub(r"\.\d{8}-\d{6}-\d{6}$", "", name)
     spec = {"META": "ok", "EMPTY": "0", "SEGMENTS": "5", "SLEEP": "0",
             "PUBLISH_DELAY": "0", "PUBLISH_FAIL": "0"}
     p = audio.parent / (name + ".stubspec")
@@ -75,6 +77,14 @@ def main() -> int:
     audio = Path(argv[0])
     out = Path(argv[argv.index("--out") + 1])
     out.mkdir(parents=True, exist_ok=True)
+    # Mirror transcribe.py's contract: a missing recording = refuse, zero calls.
+    if not audio.exists():
+        print(f"ERROR: file not found: {audio}", flush=True)
+        return 1
+    call_log = os.environ.get("WATCH_CALL_LOG")
+    if call_log:
+        with open(call_log, "a", encoding="utf-8") as f:
+            f.write(f"{os.getpid()}\t{audio}\n")
     spec = spec_for(audio)
     # Mirror transcribe.py's ownership contract: take the marker's byte lock
     # BEFORE touching the recording and hold it until exit. PUBLISH_DELAY
@@ -116,6 +126,15 @@ def main() -> int:
 if __name__ == "__main__":
     raise SystemExit(main())
 '''
+
+
+class TestStubIsCompilable(unittest.TestCase):
+    """The stub is a program-inside-a-string: an escape slip in the outer
+    literal produces a generated stub that dies at import — every processing
+    test then fails opaquely. Keep the artifact compilable by construction."""
+
+    def test_stub_source_compiles(self):
+        compile(STUB_TRANSCRIBE, "stub_transcribe.py", "exec")
 
 
 def watch_py_source() -> str:
@@ -251,16 +270,19 @@ class TestReplacementAfterCrash(WatcherTestCase):
 
 class TestCrashDuringTranscription(WatcherTestCase):
     def test_claim_survives_replacement_while_child_alive(self):
-        audio = self.fx / "inbox" / "meeting.m4a"
+        inbox = self.fx / "inbox"
+        audio = inbox / "meeting.m4a"
         audio.write_bytes(b"0" * 100)
-        (self.fx / "inbox" / "meeting.m4a.stubspec").write_text("SLEEP=300\n",
-                                                               encoding="utf-8")
+        (inbox / "meeting.m4a.stubspec").write_text("SLEEP=300\n",
+                                                    encoding="utf-8")
         a = self.run_watcher()
-        claim = self.fx / "inbox" / "meeting.m4a.processing"
-        pid_file = self.fx / "inbox" / "meeting.m4a.processing.pid"
-        wait_until(lambda: claim.exists() and pid_file.exists(),
+        wait_until(lambda: list(inbox.glob("*.processing")),
                    STABLE_POLLS * POLL_SECS + 30,
-                   "watcher to claim the recording and the child to publish its beacon")
+                   "watcher to claim the recording")
+        claim = list(inbox.glob("*.processing"))[0]  # unique-tagged claim path
+        pid_file = Path(str(claim) + ".pid")
+        wait_until(lambda: pid_file.exists(),
+                   10, "child to publish its ownership beacon")
 
         def _stub_pid_file():
             files = list(self.fx.glob("output/*/stub.pid"))
@@ -301,15 +323,20 @@ class TestOwnershipHandoff(WatcherTestCase):
     child that could then lose its recording mid-flight."""
 
     def test_claim_recoverable_before_child_publishes(self):
-        audio = self.fx / "inbox" / "meeting.m4a"
+        inbox = self.fx / "inbox"
+        audio = inbox / "meeting.m4a"
         audio.write_bytes(b"0" * 100)
-        (self.fx / "inbox" / "meeting.m4a.stubspec").write_text(
+        (inbox / "meeting.m4a.stubspec").write_text(
             "PUBLISH_DELAY=60\n", encoding="utf-8")
         a = self.run_watcher()
-        claim = self.fx / "inbox" / "meeting.m4a.processing"
-        pid_file = self.fx / "inbox" / "meeting.m4a.processing.pid"
-        wait_until(lambda: claim.exists(), STABLE_POLLS * POLL_SECS + 30,
+        wait_until(lambda: list(inbox.glob("*.processing")),
+                   STABLE_POLLS * POLL_SECS + 30,
                    "watcher to claim the recording")
+        claim = list(inbox.glob("*.processing"))[0]  # unique-tagged claim path
+        pid_file = Path(str(claim) + ".pid")
+        time.sleep(2)  # the child is spawned right after the claim
+        self.assertFalse(pid_file.exists(),
+                         "pre-publication: the child has not claimed ownership yet")
         time.sleep(2)  # the child is spawned right after the claim
         self.assertFalse(pid_file.exists(),
                          "pre-publication: the child has not claimed ownership yet")
@@ -342,6 +369,55 @@ class TestOwnershipHandoff(WatcherTestCase):
         self.assertFalse((self.fx / "inbox" / "meeting.m4a.processing.pid").exists(),
                          "a refusing child leaves no marker behind")
         self.stop(a)
+
+
+# ------------------------------------ r5 finding (unique claim per attempt)
+class TestUniqueClaimPerAttempt(WatcherTestCase):
+    """Review r5 finding: recovery moved recording A aside; recording B then
+    arrived with the SAME filename. The delayed child for A must make ZERO
+    transcription calls (its unique claim path stays gone) and B's child
+    exactly one."""
+
+    def test_recovered_a_then_b_same_name_old_child_zero_new_one_call(self):
+        call_log = self.fx / "calls.log"
+        inbox = self.fx / "inbox"
+
+        # Recording A: its child is delayed (simulating interpreter startup).
+        (inbox / "meeting.m4a").write_bytes(b"A" * 100)
+        (inbox / "meeting.m4a.stubspec").write_text("PUBLISH_DELAY=60\n",
+                                                    encoding="utf-8")
+        a = self.run_watcher({"WATCH_CALL_LOG": str(call_log)})
+        wait_until(lambda: list(inbox.glob("*.processing")),
+                   STABLE_POLLS * POLL_SECS + 30,
+                   "watcher to claim recording A")
+        a_claimed_at = time.time()
+        a.kill()  # watcher crashes; delayed child A outlives it, un-started
+        a.communicate(timeout=10)
+
+        c = self.run_watcher({"WATCH_CALL_LOG": str(call_log)})
+        wait_until(lambda: (inbox / "failed" / "meeting.m4a").exists(),
+                   3 * POLL_SECS + 20, "recovery to move A's claim aside")
+
+        # Recording B: same filename, fast.
+        (inbox / "meeting.m4a").write_bytes(b"B" * 100)
+        (inbox / "meeting.m4a.stubspec").write_text("", encoding="utf-8")
+        wait_until(lambda: (inbox / "processed" / "meeting.m4a").exists(),
+                   2 * (STABLE_POLLS * POLL_SECS) + 60,
+                   "B processed end to end")
+
+        # Release the delayed child: wait until its PUBLISH_DELAY has elapsed.
+        remaining = (a_claimed_at + 60 + 10) - time.time()  # spawn ≈ claim time
+        if remaining > 0:
+            time.sleep(remaining)
+
+        calls = (call_log.read_text(encoding="utf-8").splitlines()
+                 if call_log.exists() else [])
+        self.assertEqual(len(calls), 1,
+                         f"exactly one transcription call (B's); got: {calls}")
+        self.assertIn("meeting.m4a", calls[0])
+        self.assertEqual(list(inbox.glob("*.processing")), [],
+                         "A's unique claim path must stay gone")
+        self.stop(c)
 
 
 # ------------------------------- r2 finding 3 / condition 3 (durable status)

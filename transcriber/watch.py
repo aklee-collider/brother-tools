@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -71,6 +72,30 @@ def _dest(folder: Path, name: str) -> Path:
         p = Path(name)
         dest = folder / f"{p.stem}_{datetime.now():%Y%m%d-%H%M%S}{p.suffix}"
     return dest
+
+
+_ATTEMPT_TAG = r"\d{8}-\d{6}-\d{6}"  # YYYYmmdd-HHMMSS-ffffff, matches _claim_path
+
+
+def _claim_path(path: Path) -> Path:
+    """A unique claim path per processing attempt: <name>.<tag>.processing.
+
+    Uniqueness is what keeps a delayed child (its watcher crashed, recovery
+    moved the claim) from ever being re-attached to a NEWER recording with
+    the same filename — its argv points at a path that stays gone. The tag
+    is stripped for display everywhere the original filename matters.
+    """
+    tag = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    return path.with_name(f"{path.name}.{tag}.processing")
+
+
+def _original_name(claim_name: str) -> str:
+    """The display filename for a claim path (inverse of _claim_path)."""
+    base = claim_name[: -len(".processing")]
+    parts = base.rsplit(".", 1)
+    if len(parts) == 2 and re.fullmatch(_ATTEMPT_TAG, parts[1]):
+        return parts[0]
+    return base  # claims from older versions carry no tag
 
 
 # --------------------------------------------------------------- pid beacon
@@ -221,9 +246,9 @@ def _completeness_note(out_dir: Path) -> str:
 
 
 def process_one(path: Path) -> bool:
-    claimed = path.with_name(path.name + ".processing")
-    try:
-        os.rename(path, claimed)  # atomic claim: a second watcher won't see it
+    claimed = _claim_path(path)  # unique per attempt: a delayed child from a
+    try:                         # crashed run can never be re-attached to a
+        os.rename(path, claimed)  # newer recording with the same filename
     except OSError as exc:
         log(f"SKIP {path.name}: still locked by the sync app ({exc})")
         return False
@@ -296,11 +321,12 @@ def sweep_claims() -> None:
             log(f"Removed a stray pid marker without a claim: {stray.name}")
     for stale in INBOX.glob("*.processing"):
         marker = _pid_file(stale)
+        display = _original_name(stale.name)
         owner_note = _read_pid_file(marker)  # best-effort, for the log only
         try:
             fd = os.open(marker, os.O_RDWR | os.O_CREAT)  # tombstone if absent
         except OSError as exc:
-            log(f"SKIP {stale.name}: cannot open the marker ({exc}) — will retry.")
+            log(f"SKIP {display}: cannot open the marker ({exc}) — will retry.")
             continue
         locked = False
         try:
@@ -319,23 +345,22 @@ def sweep_claims() -> None:
                 _ANNOUNCED_ALIVE.add(stale.name)
                 who = (f"PID {owner_note}" if owner_note is not None
                        else "a live transcription")
-                log(f"CLAIM {stale.name}: {who} — still being transcribed "
+                log(f"CLAIM {display}: {who} — still being transcribed "
                     "(marker held). Leaving it until that finishes.")
             continue
         # We hold the marker lock: no child can claim this recording now.
         # Move it while still holding the lock, release, then tidy the marker.
-        original = stale.name[: -len(".processing")]
         try:
-            os.rename(stale, _dest(FAILED, original))
+            os.rename(stale, _dest(FAILED, display))
         except OSError as exc:
-            log(f"SKIP {stale.name}: cannot move it right now ({exc}) — will retry.")
+            log(f"SKIP {display}: cannot move it right now ({exc}) — will retry.")
             _release_marker_fd(fd)
             continue
         _release_marker_fd(fd)
         _ANNOUNCED_ALIVE.discard(stale.name)
         _clear_pid_file(marker)
         owner_txt = f"PID {owner_note}" if owner_note is not None else "no live owner"
-        log(f"RECOVERED claim (owner {owner_txt}) -> failed/: {original}")
+        log(f"RECOVERED claim (owner {owner_txt}) -> failed/: {display}")
 
 
 # ------------------------------------------------------------------- loop

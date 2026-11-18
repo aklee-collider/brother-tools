@@ -668,6 +668,97 @@ class TestClaimSweep(unittest.TestCase):
         self.assertEqual(list(self.failed.iterdir()), [])
 
 
+# ---------------------------------------------------------------- r5
+class TestClaimNaming(unittest.TestCase):
+    """Review r5 finding: the claim path used to be reused across attempts,
+    so a delayed child from a crashed run could be re-attached to a NEWER
+    recording with the same filename (duplicate paid calls, wrong contents).
+    Each attempt now gets a unique claim path; display keeps the original."""
+
+    def test_claim_paths_unique_per_attempt(self):
+        import time as _time
+        p1 = watch._claim_path(Path("meeting.m4a"))
+        _time.sleep(0.0001)  # attempts are poll-cycles apart; force a tag change
+        p2 = watch._claim_path(Path("meeting.m4a"))
+        self.assertNotEqual(p1.name, p2.name, "two attempts must not share a claim")
+        for p in (p1, p2):
+            self.assertTrue(p.name.endswith(".processing"))
+            self.assertEqual(watch._original_name(p.name), "meeting.m4a",
+                             "display must recover the original filename")
+
+    def test_original_name_parses_legacy_and_plain_shapes(self):
+        # Legacy claims from before r5 carried no tag; the parse must not eat
+        # real filename segments.
+        self.assertEqual(watch._original_name("meeting.m4a.processing"), "meeting.m4a")
+        self.assertEqual(
+            watch._original_name("meeting.m4a.20261118-170830-086027.processing"),
+            "meeting.m4a")
+        self.assertEqual(watch._original_name("meet.2026.11.18.m4a.processing"),
+                         "meet.2026.11.18.m4a", "dots in the real name must survive")
+
+
+# ---------------------------------------------------------------- r5
+class TestDelayedChildCantPickUpReplacement(unittest.TestCase):
+    """Review r5 finding, replayed as the forced overlap: a delayed child
+    starts, the shared filename fills with a NEW recording's bytes, the
+    child resumes. With unique claim paths the child's argv can never point
+    at another attempt's audio — its result stays its own recording. (This
+    test is RED against dd98d4e, where the claim path was reused.)"""
+
+    def test_delayed_child_transcribes_its_own_bytes(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        inbox, processed, failed = root / "inbox", root / "processed", root / "failed"
+        inbox.mkdir()
+        processed.mkdir()
+        failed.mkdir()  # production main() creates these before any processing
+        old = {"HERE": watch.HERE, "INBOX": watch.INBOX,
+               "PROCESSED": watch.PROCESSED, "FAILED": watch.FAILED}
+        watch.HERE, watch.INBOX = root, inbox
+        watch.PROCESSED, watch.FAILED = processed, failed
+        seen = {}
+
+        class _FakeProc:
+            pid = 424242
+            returncode = 0
+
+            def __init__(self, cmd):
+                self.cmd = cmd
+
+            def communicate(self, timeout=None):
+                claimed = Path(self.cmd[2])
+                seen["argv"] = str(claimed)
+                seen["bytes_at_child_start"] = claimed.read_bytes()
+                # the "release": a new recording fills the SHARED legacy name
+                # (inbox/meeting.m4a.processing) while the child is mid-flight
+                (inbox / "meeting.m4a.processing").write_bytes(b"B-CONTAMINATED!")
+                return ("", "")
+
+            def kill(self):
+                pass
+
+        try:
+            source = inbox / "meeting.m4a"
+            source.write_bytes(b"A-ORIGINAL")
+            with mock.patch.object(watch, "log"), \
+                 mock.patch.object(watch.subprocess, "Popen",
+                                   side_effect=lambda cmd, **k: _FakeProc(cmd)):
+                rc = watch.process_one(source)
+            self.assertTrue(rc)
+            result = (processed / "meeting.m4a").read_bytes()
+            self.assertEqual(result, b"A-ORIGINAL",
+                             "the delayed child must transcribe ITS recording, "
+                             "not whichever bytes later filled a shared path")
+            self.assertNotEqual(seen["argv"], str(inbox / "meeting.m4a.processing"),
+                                "the claim path must be unique per attempt")
+            self.assertEqual(seen["bytes_at_child_start"], b"A-ORIGINAL",
+                             "the child started on its own recording's bytes")
+        finally:
+            watch.HERE, watch.INBOX = old["HERE"], old["INBOX"]
+            watch.PROCESSED, watch.FAILED = old["PROCESSED"], old["FAILED"]
+
+
 # ------------------------------------------------- r3/r4: ownership first
 class TestTranscribeClaimBeacon(unittest.TestCase):
     """Review r3 finding 1 + r4 finding: the child must take the marker's
