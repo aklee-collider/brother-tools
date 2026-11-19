@@ -95,18 +95,19 @@ def _claim_path(path: Path) -> Path:
     return path.with_name(f"proc-{secrets.token_hex(6)}.processing")
 
 
-def _original_name(claim: Path, marker: Path) -> str:
-    """The recording's original filename, for display and recovery.
+def _original_name(claim: Path, fd: int) -> str:
+    """The recording's original filename, read through the caller's LOCKED fd.
 
-    Stored in the marker note when the claim is made; falls back to the
-    claim name itself for legacy claims that carried the name directly
-    (<name>.processing). Best effort while a live child holds the marker
-    (its byte lock blocks other processes' reads): the announce line falls
-    back to the opaque claim name there — recovery re-reads it once the
-    lock is free.
+    MUST be called only while the caller holds the marker's byte lock: the
+    lock blocks reads through other handles, so reading before winning the
+    lock could silently fall back to the opaque claim name (r7's defect).
+    Falls back to the claim name itself for legacy claims that carried the
+    name directly (<name>.processing), and for unreadable notes the fallback
+    is named as such in the caller's log line.
     """
     try:
-        data = json.loads(marker.read_text(encoding="utf-8"))
+        os.lseek(fd, 0, 0)
+        data = json.loads(os.read(fd, 65536).decode("utf-8", errors="replace"))
     except (OSError, ValueError):
         data = {}
     original = data.get("original") if isinstance(data, dict) else None
@@ -297,8 +298,8 @@ def process_one(path: Path) -> bool:
         _clear_pid_file(marker)
         return False
     # Ownership beacon: the CHILD takes the marker's byte lock as its first
-    # act (before it opens the recording) and merges its PID into the note.
-    # This watcher only clears the note once the child is done (a hard kill
+    # act (before it opens the recording) and holds it for its whole run.
+    # This watcher only tidies the note once the child is done (a hard kill
     # on timeout skips the child's own cleanup).
     timed_out = False
     try:
@@ -307,9 +308,13 @@ def process_one(path: Path) -> bool:
         timed_out = True
         proc.kill()
         proc.communicate()
-    _clear_pid_file(marker)  # child is done (or killed) — beacon served
     if not timed_out and proc.returncode == 0:
         os.rename(claim, _dest(PROCESSED, path.name))
+        # r7: the marker note (the ONLY record of the original filename) is
+        # tidied AFTER the audio move succeeds — an interruption at the move
+        # then leaves claim + note in the inbox, which recovery handles by
+        # name; clearing first could strand the audio under an opaque name.
+        _clear_pid_file(marker)
         try:
             note = _completeness_note(out_dir)
         except Exception as exc:  # a note must never kill the watch loop
@@ -319,6 +324,7 @@ def process_one(path: Path) -> bool:
     if timed_out:
         err = f"timeout after {PROCESS_TIMEOUT}s"
     os.rename(claim, _dest(FAILED, path.name))
+    _clear_pid_file(marker)
     log(f"FAILED {path.name}: {(err or '').strip()[-300:]}")
     return False
 
@@ -349,12 +355,10 @@ def sweep_claims() -> None:
             log(f"Removed a stray pid marker without a claim: {stray.name}")
     for stale in INBOX.glob("*.processing"):
         marker = _pid_file(stale)
-        display = _original_name(stale, marker)  # best-effort; see its notes
-        owner_note = _read_pid_file(marker)
         try:
             fd = os.open(marker, os.O_RDWR | os.O_CREAT)  # tombstone if absent
         except OSError as exc:
-            log(f"SKIP {display}: cannot open the marker ({exc}) — will retry.")
+            log(f"SKIP {stale.name}: cannot open the marker ({exc}) — will retry.")
             continue
         locked = False
         try:
@@ -371,13 +375,18 @@ def sweep_claims() -> None:
             os.close(fd)
             if stale.name not in _ANNOUNCED_ALIVE:
                 _ANNOUNCED_ALIVE.add(stale.name)
+                owner_note = _read_pid_file(marker)  # best-effort; a live
+                # child's mandatory lock blocks this read — pid may be unknown
                 who = (f"PID {owner_note}" if owner_note is not None
                        else "a live transcription")
-                log(f"CLAIM {display}: {who} — still being transcribed "
+                log(f"CLAIM {stale.name}: {who} — still being transcribed "
                     "(marker held). Leaving it until that finishes.")
             continue
-        # We hold the marker lock: no child can claim this recording now.
-        # Move it while still holding the lock, release, then tidy the marker.
+        # We hold the marker lock: no child can claim this recording now, and
+        # the note is readable ONLY through this locked fd (r7: the display
+        # name must be read under the lock — a pre-lock read could fail and
+        # strand the recovery under the opaque claim name).
+        display = _original_name(stale, fd)
         try:
             os.rename(stale, _dest(FAILED, display))
         except OSError as exc:
@@ -387,8 +396,7 @@ def sweep_claims() -> None:
         _release_marker_fd(fd)
         _ANNOUNCED_ALIVE.discard(stale.name)
         _clear_pid_file(marker)
-        owner_txt = f"PID {owner_note}" if owner_note is not None else "no live owner"
-        log(f"RECOVERED claim (owner {owner_txt}) -> failed/: {display}")
+        log(f"RECOVERED claim -> failed/: {display}")
 
 
 # ------------------------------------------------------------------- loop

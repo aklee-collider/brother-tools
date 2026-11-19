@@ -720,15 +720,29 @@ class TestClaimNaming(unittest.TestCase):
             marker = d / "proc-abc123def456.processing.pid"
             marker.write_text(json.dumps({"pid": 7, "original": "board-meeting.m4a"}),
                               encoding="utf-8")
-            self.assertEqual(watch._original_name(claim, marker), "board-meeting.m4a")
+            fd = os.open(marker, os.O_RDWR)
+            try:
+                self.assertEqual(watch._original_name(claim, fd), "board-meeting.m4a",
+                                 "the name must be readable through the LOCKED fd")
+            finally:
+                os.close(fd)
             # legacy shape: no note, the claim name carried the original
             legacy = Path("board-meeting.m4a.processing")
-            self.assertEqual(watch._original_name(legacy, d / "absent.pid"),
-                             "board-meeting.m4a")
+            fd_absent = os.open(d / "absent.pid", os.O_RDWR | os.O_CREAT)
+            try:
+                self.assertEqual(watch._original_name(legacy, fd_absent),
+                                 "board-meeting.m4a")
+            finally:
+                os.close(fd_absent)
+                (d / "absent.pid").unlink()
             # unreadable note: fallback, never an exception
             marker.write_text("{broken", encoding="utf-8")
-            self.assertEqual(watch._original_name(claim, marker),
-                             claim.name[: -len(".processing")])
+            fd_broken = os.open(marker, os.O_RDWR)
+            try:
+                self.assertEqual(watch._original_name(claim, fd_broken),
+                                 claim.name[: -len(".processing")])
+            finally:
+                os.close(fd_broken)
 
 
 # ---------------------------------------------------------------- r5/r6
@@ -937,14 +951,17 @@ class TestTranscribeClaimBeacon(unittest.TestCase):
         self.assertEqual(meta["audio"], original,
                          "display must use the ORIGINAL from the marker note")
         self.assertEqual(meta["meeting_day"], "2026-11-18")
-        # the child must PRESERVE the note's original while merging its pid;
-        # close the child's held fd first (same trick as process exit — the
-        # mandatory lock blocks other handles until then)
+        # r7 window 1: the child is READ-ONLY on the note — a truncate/merge
+        # here would crash-strand an empty note (recovery would lose the
+        # original name). Close the child's held fd first (same trick as
+        # process exit — the mandatory lock blocks other handles until then).
         os.close(transcribe._CLAIM_MARKER_FD)
         transcribe._CLAIM_MARKER_FD = None
         note = json.loads(marker.read_text(encoding="utf-8"))
-        self.assertEqual(note["original"], original)
-        self.assertEqual(note["pid"], os.getpid())
+        self.assertEqual(note["original"], original,
+                         "the note must survive the child UNTOUCHED")
+        self.assertIsNone(note["pid"],
+                         "the child must not rewrite the note (r7 window 1)")
 
     def test_display_uses_the_original_from_the_marker_note(self):
         self._display_check("Q3 board meeting.m4a")

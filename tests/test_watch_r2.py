@@ -50,27 +50,14 @@ import json, os, sys, time
 from pathlib import Path
 
 
-def spec_for(audio: Path) -> dict:
+def spec_for(original: str, inbox: Path) -> dict:
     """Per-file behavior spec: <original name>.stubspec next to the claim.
 
     Claims are opaque (proc-<id>.processing, r6) — the ORIGINAL filename
     comes from the marker note the watcher wrote before the rename.
     """
-    name = audio.name
-    if name.endswith(".processing"):
-        try:
-            note = json.loads(audio.with_name(audio.name + ".pid")
-                              .read_text(encoding="utf-8"))
-            original = note.get("original")
-            if isinstance(original, str) and original:
-                name = original
-            else:
-                name = name[: -len(".processing")]
-        except (OSError, ValueError):
-            name = name[: -len(".processing")]
-    spec = {"META": "ok", "EMPTY": "0", "SEGMENTS": "5", "SLEEP": "0",
-            "PUBLISH_DELAY": "0", "PUBLISH_FAIL": "0"}
-    p = audio.parent / (name + ".stubspec")
+    spec = {"META": "ok", "EMPTY": "0", "SEGMENTS": "5", "SLEEP": "0"}
+    p = inbox / (original + ".stubspec")
     if p.exists():
         for line in p.read_text(encoding="utf-8").splitlines():
             if "=" in line:
@@ -89,14 +76,15 @@ def main() -> int:
     if sig:
         with open(sig, "w", encoding="utf-8") as f:
             f.write(str(os.getpid()))
-    spec = spec_for(audio)
     # Mirror transcribe.py's EXACT order — interpreter startup -> marker
-    # lock -> exists-check -> paid call. A delayed child whose claim was
-    # recovered while it slept must therefore refuse BEFORE logging a call.
-    time.sleep(float(spec["PUBLISH_DELAY"]))
+    # lock (READ-ONLY on the note) -> exists-check -> paid call. A delayed
+    # child whose claim was recovered while it slept must therefore refuse
+    # BEFORE logging a call.
+    time.sleep(float(os.environ.get("WATCH_STUB_DELAY", "0")))
+    original = None
     if audio.name.endswith(".processing"):
         marker = audio.with_name(audio.name + ".pid")
-        if spec["PUBLISH_FAIL"] == "1":
+        if os.environ.get("WATCH_STUB_FAIL") == "1":
             print("ERROR: cannot open the processing marker", flush=True)
             return 3
         mfd = os.open(marker, os.O_RDWR | os.O_CREAT)
@@ -106,18 +94,15 @@ def main() -> int:
         else:
             import fcntl
             fcntl.lockf(mfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        # Merge our PID into the note WITHOUT losing the original filename.
+        # READ-ONLY on the note (mirror transcribe.py): the original name
+        # for spec discovery comes through our own locked fd.
         os.lseek(mfd, 0, 0)
         try:
             note = json.loads(os.read(mfd, 65536).decode("utf-8"))
-        except Exception:
-            note = {}
-        if not isinstance(note, dict):
-            note = {}
-        note["pid"] = os.getpid()
-        os.lseek(mfd, 0, 0)
-        os.ftruncate(mfd, 0)
-        os.write(mfd, json.dumps(note).encode())
+            if isinstance(note, dict) and isinstance(note.get("original"), str):
+                original = note["original"]
+        except (OSError, ValueError):
+            pass
     if not audio.exists():
         print(f"ERROR: file not found: {audio}", flush=True)
         return 1
@@ -130,6 +115,8 @@ def main() -> int:
     if call_log:
         with open(call_log, "a", encoding="utf-8") as f:
             f.write(f"{os.getpid()}\t{audio}\n")
+    display_name = original if original else audio.name
+    spec = spec_for(display_name, audio.parent)
     time.sleep(float(spec["SLEEP"]))
     (out / "transcript.txt").write_text("stub transcript for " + audio.name,
                                         encoding="utf-8")
@@ -349,9 +336,7 @@ class TestOwnershipHandoff(WatcherTestCase):
         inbox = self.fx / "inbox"
         audio = inbox / "meeting.m4a"
         audio.write_bytes(b"0" * 100)
-        (inbox / "meeting.m4a.stubspec").write_text(
-            "PUBLISH_DELAY=60\n", encoding="utf-8")
-        a = self.run_watcher()
+        a = self.run_watcher({"WATCH_STUB_DELAY": "60"})
         wait_until(lambda: list(inbox.glob("*.processing")),
                    STABLE_POLLS * POLL_SECS + 30,
                    "watcher to claim the recording")
@@ -384,22 +369,20 @@ class TestOwnershipHandoff(WatcherTestCase):
         self.stop(c)  # the orphaned stub self-exits when its delay elapses
 
     def test_refused_publication_fails_the_job(self):
-        # The failed-write leg of the r3 requirement: a child that cannot
-        # publish ownership refuses to start, and the watcher files the
-        # recording into failed/ with no marker left behind.
+        # The failed-open leg of the r3 requirement: a child that cannot
+        # take the marker refuses to start, and the watcher files the
+        # recording into failed/ and tidies the marker.
         audio = self.fx / "inbox" / "meeting.m4a"
         audio.write_bytes(b"0" * 100)
-        (self.fx / "inbox" / "meeting.m4a.stubspec").write_text(
-            "PUBLISH_FAIL=1\n", encoding="utf-8")
-        a = self.run_watcher()
+        a = self.run_watcher({"WATCH_STUB_FAIL": "1"})
         wait_until(lambda: (self.fx / "inbox" / "failed" / "meeting.m4a").exists(),
                    STABLE_POLLS * POLL_SECS + 40,
-                   "a child that cannot publish ownership fails loudly into failed/")
+                   "a child that cannot claim ownership fails loudly into failed/")
         log = read_log(self.fx)
         self.assertIn("FAILED meeting.m4a", log)
         self.assertNotIn("DONE meeting.m4a", log)
-        self.assertFalse((self.fx / "inbox" / "meeting.m4a.processing.pid").exists(),
-                         "a refusing child leaves no marker behind")
+        wait_until(lambda: not (self.fx / "inbox" / "meeting.m4a.processing.pid").exists(),
+                   2 * POLL_SECS + 10, "the watcher tidies the marker after the refusal")
         self.stop(a)
 
 
@@ -424,10 +407,9 @@ class TestUniqueClaimPerAttempt(WatcherTestCase):
 
         # Recording A: its child is delayed (simulating interpreter startup).
         (inbox / "meeting.m4a").write_bytes(b"A" * 100)
-        (inbox / "meeting.m4a.stubspec").write_text("PUBLISH_DELAY=60\n",
-                                                    encoding="utf-8")
         a = self.run_watcher({"WATCH_CALL_LOG": str(call_log),
-                              "WATCH_START_SIGNAL": str(start_signal)})
+                              "WATCH_START_SIGNAL": str(start_signal),
+                              "WATCH_STUB_DELAY": "60"})
         wait_until(lambda: list(inbox.glob("*.processing")),
                    STABLE_POLLS * POLL_SECS + 30,
                    "watcher to claim recording A")
@@ -439,15 +421,14 @@ class TestUniqueClaimPerAttempt(WatcherTestCase):
         a.kill()
         a.communicate(timeout=10)
 
-        c = self.run_watcher({"WATCH_CALL_LOG": str(call_log)})
+        c = self.run_watcher({"WATCH_CALL_LOG": str(call_log),
+                              "WATCH_STUB_DELAY": "90"})
         wait_until(lambda: (inbox / "failed" / "meeting.m4a").exists(),
                    3 * POLL_SECS + 20, "recovery to move A's claim aside")
 
         # Recording B: same filename; its child is delayed PAST A's wake-up,
         # so at t=60 the shared path holds B and nobody holds the marker.
         (inbox / "meeting.m4a").write_bytes(b"B" * 100)
-        (inbox / "meeting.m4a.stubspec").write_text("PUBLISH_DELAY=90\n",
-                                                    encoding="utf-8")
         wait_until(lambda: (inbox / "processed" / "meeting.m4a").exists(),
                    2 * (STABLE_POLLS * POLL_SECS) + 120,
                    "B processed end to end (its child sleeps 90s first)")
