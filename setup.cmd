@@ -42,10 +42,12 @@ echo.
 rem -- 3. First-run key files: create .env from the example if missing --
 if not exist "transcriber\.env" (
     copy /y "transcriber\.env.example" "transcriber\.env" >nul
-    echo [NEXT STEP] transcriber\.env was created for you — open it and paste
-    echo     your two API keys. Get them:
-    echo       Zhipu BigModel ^(transcription^): https://open.bigmodel.cn
-    echo       DeepSeek ^(summaries^):           https://platform.deepseek.com
+    echo [NEXT STEP] transcriber\.env was created for you — open it and
+    echo     paste your key, then set SUMMARY_MODEL=glm-5.3-flash in the
+    echo     same file. One key runs everything:
+    echo       Zhipu BigModel ^(transcription^) + summaries: https://open.bigmodel.cn
+    echo     Prefer your own DeepSeek account for summaries instead? Paste a
+    echo     DEEPSEEK_API_KEY and skip SUMMARY_MODEL — see .env.example.
 )
 if not exist "news\.env" (
     copy /y "news\.env.example" "news\.env" >nul

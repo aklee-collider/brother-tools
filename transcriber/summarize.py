@@ -9,7 +9,10 @@ v2: tags the meeting with an active project (projects.json) and analyzes
 communication effectiveness — outcome, objections, and concrete persuasion
 recommendations for the next conversation when the goal was not achieved.
 
-Setup: DEEPSEEK_API_KEY in .env (platform.deepseek.com).
+Setup: SUMMARY_MODEL (e.g. glm-5.3-flash) selects the GLM provider on the
+same ZHIPU_API_KEY that powers transcription — the one-key setup. Without
+it, summaries run on DeepSeek as before (DEEPSEEK_API_KEY in .env,
+platform.deepseek.com).
 """
 
 from __future__ import annotations
@@ -27,8 +30,33 @@ load_dotenv(Path(__file__).resolve().parent / ".env")
 
 DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
+GLM_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
 MAX_EVENT_DAYS = 365
 OUTCOMES = ("achieved", "partial", "not_achieved", "unclear")
+
+
+def _provider() -> dict:
+    """Pick the summary provider. A non-empty SUMMARY_MODEL selects the GLM
+    chat endpoint on the same ZHIPU_API_KEY that runs transcription (the
+    one-key setup); unset keeps the original DeepSeek path. Whichever
+    provider is selected is the ONLY one called — no silent cross-provider
+    fallback; both error paths are loud."""
+    model = (os.getenv("SUMMARY_MODEL") or "").strip()
+    if model:
+        key = os.getenv("ZHIPU_API_KEY")
+        if not key:
+            raise RuntimeError(
+                "SUMMARY_MODEL is set but ZHIPU_API_KEY is not — paste your "
+                "GLM key into .env (it runs both transcription and summaries)"
+            )
+        return {"url": GLM_URL, "model": model, "key": key, "name": "GLM"}
+    key = os.getenv("DEEPSEEK_API_KEY")
+    if not key:
+        raise RuntimeError(
+            "DEEPSEEK_API_KEY not set — copy .env.example to .env and paste your key"
+        )
+    return {"url": DEEPSEEK_URL, "model": DEEPSEEK_MODEL, "key": key,
+            "name": "DeepSeek"}
 
 
 def _clean_str_list(raw, cap: int = 6, maxlen: int = 400) -> list[str]:
@@ -114,13 +142,10 @@ def _validate(data: dict, meeting_day: str, project_keys: set[str]) -> dict:
 def summarize(transcript: str, meeting_day: str | None = None,
               projects: list[dict] | None = None,
               project_key: str | None = None) -> dict:
-    """One DeepSeek call -> validated {project, summary, priorities, events,
-    insights}. projects: [{key, name, context}]; project_key forces the tag."""
-    key = os.getenv("DEEPSEEK_API_KEY")
-    if not key:
-        raise RuntimeError(
-            "DEEPSEEK_API_KEY not set — copy .env.example to .env and paste your key"
-        )
+    """One LLM call -> validated {project, summary, priorities, events,
+    insights}. The provider (GLM one-key or DeepSeek) is chosen by
+    _provider(). projects: [{key, name, context}]; project_key forces the tag."""
+    provider = _provider()
     meeting_day = meeting_day or date.today().isoformat()
     projects = projects or []
     project_keys = {p["key"] for p in projects}
@@ -163,15 +188,16 @@ def summarize(transcript: str, meeting_day: str | None = None,
         "No markdown fences, no commentary."
     )
     payload = {
-        "model": DEEPSEEK_MODEL,
+        "model": provider["model"],
         "messages": [{"role": "system", "content": system},
                      {"role": "user", "content": transcript}],
         "temperature": 0,
         "max_tokens": 16384,
     }
     req = urllib.request.Request(
-        DEEPSEEK_URL, data=json.dumps(payload).encode("utf-8"),
-        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        provider["url"], data=json.dumps(payload).encode("utf-8"),
+        headers={"Authorization": f"Bearer {provider['key']}",
+                 "Content-Type": "application/json"},
     )
     with urllib.request.urlopen(req, timeout=180) as resp:
         body = json.loads(resp.read().decode("utf-8"))

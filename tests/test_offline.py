@@ -1117,5 +1117,225 @@ class TestCmdFilesNoLiveParensInBlocks(unittest.TestCase):
         self.assertEqual(self._violations(good), [])
 
 
+# ------------------------------------------- GLM one-key summary provider
+class TestSummaryProviderSelection(unittest.TestCase):
+    """SUMMARY_MODEL selects the GLM chat endpoint on the same ZHIPU_API_KEY
+    that runs transcription (the one-key setup); unset keeps DeepSeek
+    exactly as before. The selected provider is the ONLY call — no silent
+    cross-provider fallback; both error paths are loud."""
+
+    # a reply with a fence + two invalid rows + one past event: only the
+    # same-coercion path produces the known shape out of this
+    GLM_REPLY = (
+        "```json\n" + json.dumps({
+            "summary": "Discussed the Q1 rollout plan; owner owns the timeline.",
+            "project": None,
+            "priorities": [
+                {"task": "Send the recap email", "owner": "A", "due": "2026-11-20",
+                 "priority": "high"},
+                {"task": "", "owner": None, "due": None, "priority": "low"}],
+            "events": [
+                {"date": "2026-11-25", "subject": "Follow-up call", "notes": "n"},
+                {"date": "2020-01-01", "subject": "past event", "notes": ""}],
+            "insights": {"outcome": "partial", "objections": ["price"],
+                         "recommendations": ["bring the pilot data"]},
+        }) + "\n```"
+    )
+
+    def _reply(self, content: str):
+        resp = mock.Mock()
+        resp.__enter__ = mock.Mock(return_value=resp)
+        resp.__exit__ = mock.Mock(return_value=False)
+        resp.read.return_value = json.dumps(
+            {"choices": [{"message": {"content": content}}]}).encode("utf-8")
+        return resp
+
+    def _call(self, env, reply=None):
+        captured = []
+
+        def fake_urlopen(req, timeout=None):
+            captured.append(req)
+            return reply
+
+        with mock.patch.dict(os.environ, env, clear=True), \
+             mock.patch.object(transcribe.summarize.urllib.request, "urlopen",
+                               side_effect=fake_urlopen):
+            out = transcribe.summarize.summarize("hello world",
+                                                 meeting_day="2026-11-19")
+        return out, captured
+
+    def test_glm_selected_when_summary_model_set(self):
+        env = {"SUMMARY_MODEL": "glm-5.3-flash", "ZHIPU_API_KEY": "test-glm-key"}
+        out, reqs = self._call(env, reply=self._reply(self.GLM_REPLY))
+        self.assertEqual(len(reqs), 1, "exactly one provider call")
+        req = reqs[0]
+        self.assertEqual(req.get_full_url(), transcribe.summarize.GLM_URL)
+        self.assertEqual(req.headers.get("Authorization"), "Bearer test-glm-key")
+        payload = json.loads(req.data.decode("utf-8"))
+        self.assertEqual(payload["model"], "glm-5.3-flash")
+        self.assertEqual([m["role"] for m in payload["messages"]], ["system", "user"])
+        self.assertEqual(payload["messages"][1]["content"], "hello world")
+        # the SAME coercion ran: fence stripped, invalid rows dropped,
+        # dates validated against the meeting day
+        self.assertEqual(out["summary"],
+                         "Discussed the Q1 rollout plan; owner owns the timeline.")
+        self.assertEqual(out["priorities"],
+                         [{"task": "Send the recap email", "owner": "A",
+                           "due": "2026-11-20", "priority": "high"}])
+        self.assertEqual(out["events"],
+                         [{"date": "2026-11-25", "subject": "Follow-up call",
+                           "notes": "n"}])
+        self.assertEqual(out["insights"]["outcome"], "partial")
+        self.assertEqual(out["insights"]["objections"], ["price"])
+
+    def test_deepseek_default_when_summary_model_unset(self):
+        out, reqs = self._call({"DEEPSEEK_API_KEY": "test-ds-key"},
+                               reply=self._reply(self.GLM_REPLY))
+        self.assertEqual(len(reqs), 1)
+        req = reqs[0]
+        self.assertEqual(req.get_full_url(), transcribe.summarize.DEEPSEEK_URL)
+        self.assertNotIn("bigmodel.cn", req.get_full_url(),
+                         "regression guard: the unset path must never touch GLM")
+        self.assertEqual(req.headers.get("Authorization"), "Bearer test-ds-key")
+        payload = json.loads(req.data.decode("utf-8"))
+        self.assertEqual(payload["model"], transcribe.summarize.DEEPSEEK_MODEL)
+
+    def test_blank_summary_model_is_unset(self):
+        # just-outside edges: empty and whitespace-only mean unset
+        for blank in ("", "   "):
+            with self.subTest(summary_model=repr(blank)):
+                _, reqs = self._call({"SUMMARY_MODEL": blank,
+                                      "DEEPSEEK_API_KEY": "test-ds-key"},
+                                     reply=self._reply(self.GLM_REPLY))
+                self.assertEqual(len(reqs), 1)
+                self.assertNotIn("bigmodel.cn", reqs[0].get_full_url())
+
+    def test_glm_http_error_is_loud_and_no_fallback(self):
+        err = transcribe.summarize.urllib.error.HTTPError(
+            transcribe.summarize.GLM_URL, 500, "Internal Server Error", None, None)
+        env = {"SUMMARY_MODEL": "glm-5.3-flash", "ZHIPU_API_KEY": "test-glm-key",
+               "DEEPSEEK_API_KEY": "test-ds-key"}
+        captured = []
+
+        def fake_urlopen(req, timeout=None):
+            captured.append(req)
+            raise err
+
+        with mock.patch.dict(os.environ, env, clear=True), \
+             mock.patch.object(transcribe.summarize.urllib.request, "urlopen",
+                               side_effect=fake_urlopen):
+            with self.assertRaises(transcribe.summarize.urllib.error.HTTPError):
+                transcribe.summarize.summarize("hello world",
+                                               meeting_day="2026-11-19")
+        self.assertEqual(len(captured), 1,
+                         "a GLM failure must NOT silently retry on DeepSeek")
+        self.assertIn("bigmodel.cn", captured[0].get_full_url())
+
+    def test_glm_without_key_is_loud_before_any_call(self):
+        env = {"SUMMARY_MODEL": "glm-5.3-flash"}
+        captured = []
+
+        def fake_urlopen(req, timeout=None):
+            captured.append(req)
+            return self._reply(self.GLM_REPLY)
+
+        with mock.patch.dict(os.environ, env, clear=True), \
+             mock.patch.object(transcribe.summarize.urllib.request, "urlopen",
+                               side_effect=fake_urlopen):
+            with self.assertRaises(RuntimeError) as ctx:
+                transcribe.summarize.summarize("hello world",
+                                               meeting_day="2026-11-19")
+        self.assertIn("ZHIPU_API_KEY", str(ctx.exception))
+        self.assertEqual(captured, [], "no network call may be attempted")
+
+
+class TestCheckInstallationKeyModes(unittest.TestCase):
+    """The key checks must accept BOTH complete setups: one-key (GLM) and
+    two-key (DeepSeek). A missing summary provider and a blank SUMMARY_MODEL
+    are flagged with actionable text; news without a DeepSeek key is green
+    (raw-headlines mode is a supported setup, not a gap)."""
+
+    PROJECTS = json.dumps([{"key": "k", "name": "n", "context": "c"}])
+    CATEGORIES = json.dumps([{"key": "c", "name": "C", "focus": "f",
+                              "feeds": [{"name": "F", "url": "https://example.org/rss"}]}])
+
+    def _root(self, tenv=None, news=None):
+        td = tempfile.TemporaryDirectory()
+        root = Path(td.name)
+        (root / "transcriber" / "ffmpeg").mkdir(parents=True)
+        (root / "news").mkdir()
+        if tenv is not None:
+            (root / "transcriber" / ".env").write_text(tenv, encoding="utf-8")
+        if news is not None:
+            (root / "news" / ".env").write_text(news, encoding="utf-8")
+        (root / "transcriber" / "projects.json").write_text(self.PROJECTS,
+                                                            encoding="utf-8")
+        (root / "news" / "categories.json").write_text(self.CATEGORIES,
+                                                       encoding="utf-8")
+        self.addCleanup(td.cleanup)
+        return root
+
+    def _rows(self, c, needle):
+        return [r for r in c.rows if needle in r[1]]
+
+    def test_one_key_setup_checks_green(self):
+        c = check_installation.run_checks(self._root(
+            tenv="ZHIPU_API_KEY=xxx\nSUMMARY_MODEL=glm-5.3-flash\n",
+            news="# no key pasted\n"))
+        keys = self._rows(c, "API keys file")
+        self.assertEqual(len(keys), 1)
+        self.assertTrue(keys[0][2])
+        prov = self._rows(c, "summary provider")
+        self.assertEqual(len(prov), 1)
+        self.assertTrue(prov[0][2], "one-key setup must check green")
+        self.assertIn("GLM", prov[0][1])
+        news = self._rows(c, "news keys")
+        self.assertEqual(len(news), 1)
+        self.assertTrue(news[0][2], "no DeepSeek key is a supported mode")
+        self.assertIn("raw-headlines", news[0][1])
+
+    def test_two_key_setup_checks_green(self):
+        c = check_installation.run_checks(self._root(
+            tenv="ZHIPU_API_KEY=xxx\nDEEPSEEK_API_KEY=yyy\n",
+            news="DEEPSEEK_API_KEY=yyy\n"))
+        prov = self._rows(c, "summary provider")
+        self.assertEqual(len(prov), 1)
+        self.assertTrue(prov[0][2], "classic two-key setup must still pass")
+        self.assertIn("DeepSeek", prov[0][1])
+        news = self._rows(c, "news keys")
+        self.assertTrue(news and news[0][2])
+        self.assertIn("AI summaries on", news[0][1])
+
+    def test_no_summary_provider_is_flagged(self):
+        c = check_installation.run_checks(self._root(
+            tenv="ZHIPU_API_KEY=xxx\n", news="# nothing\n"))
+        prov = self._rows(c, "summary provider")
+        self.assertEqual(len(prov), 1)
+        self.assertFalse(prov[0][2],
+                         "a key file with no summary provider must be flagged")
+        self.assertIn("SUMMARY_MODEL", prov[0][3])
+        self.assertIn("DEEPSEEK_API_KEY", prov[0][3])
+
+    def test_blank_summary_model_is_still_flagged(self):
+        # boundary probe: present-but-empty must behave like unset
+        for line in ("SUMMARY_MODEL=\n", "SUMMARY_MODEL=   \n"):
+            with self.subTest(line=repr(line)):
+                c = check_installation.run_checks(self._root(
+                    tenv="ZHIPU_API_KEY=xxx\n" + line, news="# nothing\n"))
+                prov = self._rows(c, "summary provider")
+                self.assertEqual(len(prov), 1)
+                self.assertFalse(prov[0][2],
+                                 f"blank {line!r} must not count as a provider")
+
+    def test_missing_zhipu_key_is_flagged_with_plain_language(self):
+        c = check_installation.run_checks(self._root(
+            tenv="SUMMARY_MODEL=glm-5.3-flash\n", news="# nothing\n"))
+        keys = self._rows(c, "API keys file")
+        self.assertEqual(len(keys), 1)
+        self.assertFalse(keys[0][2])
+        self.assertIn("missing or empty", keys[0][3])
+        self.assertIn("ZHIPU_API_KEY", keys[0][3])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
