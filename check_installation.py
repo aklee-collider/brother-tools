@@ -86,25 +86,47 @@ def _env_state(path: Path, wanted_keys: list[str]) -> tuple[bool, list[str], str
 
 
 def check_env_files(c: Check, root: Path) -> None:
-    plans = [
-        ("transcriber", root / "transcriber" / ".env",
-         ["ZHIPU_API_KEY", "DEEPSEEK_API_KEY"],
-         root / "transcriber" / ".env.example"),
-        ("news", root / "news" / ".env", ["DEEPSEEK_API_KEY"],
-         root / "news" / ".env.example"),
-    ]
-    for tool, env_path, keys, example in plans:
-        exists, missing, err = _env_state(env_path, keys)
-        if not exists:
-            c.add(tool, f"API keys file ({env_path.name})", False,
-                  f"copy {example.name} to {env_path.name} (same folder) and paste "
-                  "your key(s) in — never share or commit that file")
-            continue
+    # transcriber: the GLM key always runs transcription. Summaries run
+    # through GLM when SUMMARY_MODEL is set (the one-key setup) or through
+    # DeepSeek when its own key is pasted — either is a complete setup.
+    tenv = root / "transcriber" / ".env"
+    texample = root / "transcriber" / ".env.example"
+    exists, missing, _ = _env_state(tenv, ["ZHIPU_API_KEY"])
+    if not exists:
+        c.add("transcriber", f"API keys file ({tenv.name})", False,
+              f"copy {texample.name} to {tenv.name} (same folder) and paste "
+              "your key(s) in — never share or commit that file")
+    else:
         if missing:
-            c.add(tool, f"API keys file ({env_path.name})", False,
-                  f"missing or empty in {env_path.name}: {', '.join(missing)}")
+            c.add("transcriber", f"API keys file ({tenv.name})", False,
+                  f"missing or empty in {tenv.name}: {', '.join(missing)}")
         else:
-            c.add(tool, f"API keys file ({env_path.name})", True)
+            c.add("transcriber", f"API keys file ({tenv.name})", True)
+        _, summ_missing, _ = _env_state(tenv, ["SUMMARY_MODEL", "DEEPSEEK_API_KEY"])
+        if "SUMMARY_MODEL" in summ_missing and "DEEPSEEK_API_KEY" in summ_missing:
+            c.add("transcriber", "summary provider (.env)", False,
+                  "no summary provider in .env — either set "
+                  "SUMMARY_MODEL=glm-5.3-flash (runs on the same GLM key) or "
+                  "paste a DEEPSEEK_API_KEY (platform.deepseek.com)")
+        elif "SUMMARY_MODEL" not in summ_missing:
+            c.add("transcriber", "summary provider (GLM — one key, SUMMARY_MODEL)", True)
+        else:
+            c.add("transcriber", "summary provider (DeepSeek, DEEPSEEK_API_KEY)", True)
+
+    # news: DeepSeek powers the AI summaries and is OPTIONAL — without any
+    # key the briefing still works and shows raw headlines.
+    nenv = root / "news" / ".env"
+    nexample = root / "news" / ".env.example"
+    exists, missing, _ = _env_state(nenv, ["DEEPSEEK_API_KEY"])
+    if not exists:
+        c.add("news", f"news keys file ({nenv.name})", False,
+              f"copy {nexample.name} to {nenv.name} (same folder) — optional "
+              "AI summaries; without a key the briefing shows raw headlines")
+    elif missing:
+        c.add("news", "news keys (raw-headlines mode — no DEEPSEEK_API_KEY, "
+                      "which is optional)", True)
+    else:
+        c.add("news", "news keys (AI summaries on, DEEPSEEK_API_KEY)", True)
 
 
 def check_configs(c: Check, root: Path) -> None:

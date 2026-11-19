@@ -14,8 +14,11 @@ Two small tools, built to be low-maintenance:
    `.env` key files, and then checks everything. (Python itself must be
    installed first: <https://www.python.org/downloads/>, tick **"Add
    python.exe to PATH"** — `setup.cmd` tells you if it's missing.)
-2. Paste your API keys into the `.env` files as instructed
-   (`transcriber/.env` needs two, `news/.env` reuses the DeepSeek one).
+2. Paste **one key** into `transcriber\.env` (the GLM key from
+   <https://open.bigmodel.cn>) and set `SUMMARY_MODEL=glm-5.3-flash` in the
+   same file — that runs transcription AND meeting summaries. `news\.env`
+   is optional: a DeepSeek key there turns on AI news summaries; without
+   one the daily briefing shows raw headlines.
 3. Run anything ffmpeg-related asks for: open PowerShell once and run
    `winget install --id Gyan.FFmpeg -e` (only needed for recordings longer
    than 30 seconds).

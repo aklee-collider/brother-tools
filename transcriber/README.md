@@ -29,13 +29,17 @@ Manual steps, if you prefer:
    `transcriber` folder. Either way works.
 3. **Libraries** — double-click `setup.cmd` (in the main folder), or:
    `python -m pip install -r requirements.txt`.
-4. **API keys** — two paid APIs (both cheap, pay-as-you-go):
-   - **Zhipu BigModel** (transcription): sign up at <https://open.bigmodel.cn>,
-     create an API key, top up a small amount (¥10 covers ~2.5 hours of audio).
-   - **DeepSeek** (summary + tasks + insights): sign up at
-     <https://platform.deepseek.com>, create an API key, top up a few dollars.
-   - Copy `.env.example` to `.env` (same folder) and paste both keys in.
+4. **API key** — ONE paid API runs everything (transcription + summaries;
+   cheap, pay-as-you-go):
+   - **Zhipu BigModel**: sign up at <https://open.bigmodel.cn>, create an
+     API key, top up a small amount (¥10 covers ~2.5 hours of audio).
+   - Copy `.env.example` to `.env` (same folder), paste the key as
+     `ZHIPU_API_KEY`, and set `SUMMARY_MODEL=glm-5.3-flash`.
      **Never share or commit `.env` — it's your wallet.**
+   - *Prefer your own DeepSeek account for summaries instead?* Paste a
+     `DEEPSEEK_API_KEY` (from <https://platform.deepseek.com>) in the same
+     `.env` and skip `SUMMARY_MODEL` — both setups work; `.env.example`
+     explains the difference.
 
 ## The seamless phone workflow
 
@@ -113,20 +117,27 @@ corrected date also lands in the calendar file.
 - Transcription ≈ **¥0.06/minute** (~1¢ CAD/min); a 1-hour meeting ≈ ¥3.6.
   Long meetings take a while (the API processes 29-second chunks in order) —
   the watcher runs in the background, so just let it work.
-- The summary/insights step costs a few cents per meeting on DeepSeek.
+- The summary/insights step costs a few cents per meeting on the same key
+  (nothing extra to top up — one wallet).
 - Every run appends its estimate to `output/cost_YYYY-MM-DD.log`.
-- **Audio is uploaded to Zhipu's servers (China); the transcript goes to
-  DeepSeek.** Don't run confidential recordings through it unless that's
-  acceptable to you. Recordings in `inbox/` stay on your machine and are
-  git-ignored.
+- **Audio is uploaded to Zhipu's servers (China); in the one-key setup the
+  transcript goes there too.** (With the optional DeepSeek setup, the
+  transcript goes to DeepSeek instead.) Don't run confidential recordings
+  through it unless that's acceptable to you. Recordings in `inbox/` stay
+  on your machine and are git-ignored.
 
 ## Troubleshooting
 
 - `ZHIPU_API_KEY not set` → you skipped step 4, or named the file `.env.txt`
   (Windows hides extensions — check).
+- `SUMMARY_MODEL is set but ZHIPU_API_KEY is not` → the summary model is on
+  but the key line in `.env` is still empty (or `.env` got named `.env.txt`).
 - `ASR HTTP 401` → key wrong.
 - `ASR HTTP 429` (code 1113, "余额不足") → wallet empty — top up at
   open.bigmodel.cn, then re-run.
+- Summary step fails with `HTTP Error 401` → the key is wrong; `HTTP Error
+  429` → wallet empty or rate-limited — top up at open.bigmodel.cn, then
+  resume (no transcription cost).
 - Long file fails with a 30-second error → ffmpeg isn't installed (step 2).
 - `incomplete conversion` / `ffmpeg failed` → the recording did not convert
   fully (corrupt file, or the PC slept mid-copy). The tool refuses rather
@@ -135,7 +146,8 @@ corrected date also lands in the calendar file.
   may be missing from the transcript (usually a bad patch of audio). The
   result is still saved; listen to the original around the gap if in doubt.
 - Transcript saved but summary failed → your transcript is safe in
-  `output\`; fix the DeepSeek key and resume with
+  `output\`; fix the summary key (`ZHIPU_API_KEY` + `SUMMARY_MODEL`, or
+  `DEEPSEEK_API_KEY`) and resume with
   `python transcribe.py --resume output\<folder>` (no transcription cost).
 - `A watcher is already running` → exactly that. One watcher does all the
   work; if that copy is actually gone (crash, reboot), the lock releases by

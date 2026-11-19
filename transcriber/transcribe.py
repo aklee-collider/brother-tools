@@ -192,7 +192,7 @@ def main() -> int:
     ap.add_argument("--date-assumed", action="store_true",
                     help="(used by watch.cmd) label the date as assumed from the recording file")
     ap.add_argument("--project", help="project key from projects.json (e.g. westcliff, 2nimbus); default: inferred from the transcript")
-    ap.add_argument("--no-summary", action="store_true", help="transcript only, skip the DeepSeek step")
+    ap.add_argument("--no-summary", action="store_true", help="transcript only, skip the summary step")
     ap.add_argument("--out", help="output folder (default: output/<name>_<timestamp>)")
     ap.add_argument("--open", action="store_true", help="open the output folder when done")
     args = ap.parse_args()
