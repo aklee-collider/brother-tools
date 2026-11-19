@@ -9,12 +9,38 @@ to inbox/processed/ (failures go to inbox/failed/ — re-drop to retry).
 Run: double-click watch.cmd and leave the window open. Ctrl+C stops.
 The meeting date is taken from the file's modified time (the recording date),
 so "next Friday" resolves against when you actually met.
+
+Two safety mechanisms, both OS-level so they survive crashes:
+
+- Single instance: the watcher holds an exclusive byte lock on watch.lock for
+  its whole lifetime. A second copy cannot take that byte — the OS decides
+  atomically, so even two copies started at the same instant cannot both win.
+  When the watcher exits or crashes, the OS releases the byte by itself:
+  starting a new watcher after a crash needs no cleanup. The lock FILE stays
+  in place forever (deleting it would be racy on Unix — a replacement could
+  lock the old file while a third process creates a fresh one); its content
+  is just a note for the refusal message.
+- Claim safety: while a recording is being processed it is renamed to a
+  unique, clock-independent claim path (proc-<id>.processing — the id is
+  crypto-random, so a clock step, NTP adjustment, or repeated clock reading
+  can never hand a delayed child a path a NEWER recording is using). The
+  ORIGINAL filename travels in the marker note (<claim>.pid), written
+  BEFORE the rename: recovery and the transcript keep the real name, and
+  the working-file names stay short no matter how long the recording's
+  name is. Ownership of the claim is decided by ONE atomic thing: the byte
+  lock on the marker file. The transcribe.py child takes that lock as its
+  first act (before opening the recording) and holds it for its whole run;
+  recovery must win the same lock before it may move the claim, so
+  claiming and recovering cannot overlap: whoever loses the lock attempt
+  loses atomically, and the OS releases the lock when a process exits or
+  crashes.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import secrets
 import subprocess
 import sys
 import time
@@ -30,6 +56,9 @@ AUDIO_EXTS = {".m4a", ".mp3", ".wav", ".ogg", ".opus", ".aac", ".flac", ".mp4", 
 POLL_SECS = 10
 STABLE_POLLS = 2  # size+mtime unchanged across 2 polls (~20s) = upload finished
 PROCESS_TIMEOUT = 7200  # long meetings chunk into many 29s API calls
+
+_LOCK_STREAM = None  # held open for the process lifetime = holds the byte lock
+_ANNOUNCED_ALIVE: set[str] = set()  # claims already logged as "child still running"
 
 
 def log(msg: str) -> None:
@@ -51,124 +80,326 @@ def _dest(folder: Path, name: str) -> Path:
     return dest
 
 
-def process_one(path: Path) -> bool:
-    claimed = path.with_name(path.name + ".processing")
-    try:
-        os.rename(path, claimed)  # atomic claim: a second watcher won't see it
-    except OSError as exc:
-        log(f"SKIP {path.name}: still locked by the sync app ({exc})")
-        return False
-    meeting_day = datetime.fromtimestamp(claimed.stat().st_mtime).date().isoformat()
-    out_dir = HERE / "output" / f"{path.stem}_{datetime.now():%Y%m%d-%H%M%S}"
-    log(f"PROCESS {path.name} (meeting date {meeting_day})")
-    try:
-        r = subprocess.run(
-            [sys.executable, str(HERE / "transcribe.py"), str(claimed),
-             "--date", meeting_day, "--date-assumed", "--out", str(out_dir)],
-            capture_output=True, text=True, timeout=PROCESS_TIMEOUT,
-        )
-    except subprocess.TimeoutExpired:
-        r = None
-    except OSError as exc:
-        log(f"FAILED {path.name}: cannot launch transcribe.py ({exc})")
-        os.rename(claimed, _dest(FAILED, path.name))
-        return False
-    if r is not None and r.returncode == 0:
-        os.rename(claimed, _dest(PROCESSED, path.name))
-        log(f"DONE {path.name} -> {out_dir}")
-        return True
-    err = r.stderr.strip()[-300:] if r is not None else f"timeout after {PROCESS_TIMEOUT}s"
-    os.rename(claimed, _dest(FAILED, path.name))
-    log(f"FAILED {path.name}: {err}")
-    return False
+def _claim_path(path: Path) -> Path:
+    """A unique, clock-independent claim path: proc-<id>.processing.
 
-
-def _pid_alive(pid: int) -> bool:
-    """Is a process with this PID running right now?"""
-    if os.name != "nt":
-        try:
-            os.kill(pid, 0)
-            return True
-        except OSError:
-            return False
-    import ctypes
-    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-    STILL_ACTIVE = 259
-    k32 = ctypes.windll.kernel32
-    h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-    if not h:
-        return False
-    try:
-        code = ctypes.c_ulong()
-        if not k32.GetExitCodeProcess(h, ctypes.byref(code)):
-            return False
-        return code.value == STILL_ACTIVE
-    finally:
-        k32.CloseHandle(h)
-
-
-def acquire_lock() -> bool:
-    """Allow only one watcher.
-
-    A second watcher is the one thing recover_stale() cannot survive: its
-    startup sweep would move a recording the first watcher is actively
-    processing into failed/. So a live lock holder refuses the new copy with
-    a plain-language message; a stale lock (crashed watcher — PID gone, or a
-    corrupt/empty lock from a half-written write) is taken over.
+    The id is crypto-random (secrets), NOT the wall clock: clock steps, NTP
+    adjustments, or two starts inside one clock tick can repeat a timestamp
+    reading, and a repeated reading would re-attach a delayed child to a
+    NEWER recording with the same filename (duplicate paid call, wrong
+    contents). The original filename travels in the marker note (written
+    before the rename), so working-file names stay short no matter how long
+    the recording's name is — the lock marker must fit Windows' 255-char
+    filename limit for ANY recording.
     """
-    if LOCK_FILE.exists():
-        try:
-            info = json.loads(LOCK_FILE.read_text(encoding="utf-8"))
-            pid = int(info.get("pid") or 0)
-            started = str(info.get("started") or "?")
-        except (OSError, ValueError):
-            pid, started = 0, "?"  # corrupt/empty lock = crashed mid-write
-        if pid and _pid_alive(pid):
-            print(
-                f"A watcher is already running (PID {pid}, started {started}).\n"
-                "This second copy will NOT start — two watchers would fight over\n"
-                "the same recordings and could file one into failed\\ by mistake.\n"
-                f"If that copy is actually gone (e.g. after a reboot), delete\n"
-                f"{LOCK_FILE.name} and start watch.cmd again.",
-                flush=True,
-            )
-            return False
-        log(f"Taking over a stale lock from PID {pid or '?'} ({started}) — that watcher is gone.")
-        try:
-            LOCK_FILE.unlink()
-        except OSError as exc:
-            print(f"Cannot remove the stale lock file: {exc}", flush=True)
-            return False
-    payload = json.dumps({"pid": os.getpid(),
-                          "started": datetime.now().isoformat(timespec="seconds")})
-    try:
-        fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-    except FileExistsError:
-        print("Another watcher just grabbed the lock — exiting.", flush=True)
-        return False
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.write(payload)
-    return True
+    return path.with_name(f"proc-{secrets.token_hex(6)}.processing")
 
 
-def release_lock() -> None:
+def _original_name(claim: Path, fd: int) -> str:
+    """The recording's original filename, read through the caller's LOCKED fd.
+
+    MUST be called only while the caller holds the marker's byte lock: the
+    lock blocks reads through other handles, so reading before winning the
+    lock could silently fall back to the opaque claim name (r7's defect).
+    Falls back to the claim name itself for legacy claims that carried the
+    name directly (<name>.processing), and for unreadable notes the fallback
+    is named as such in the caller's log line.
+    """
     try:
-        LOCK_FILE.unlink()
+        os.lseek(fd, 0, 0)
+        data = json.loads(os.read(fd, 65536).decode("utf-8", errors="replace"))
+    except (OSError, ValueError):
+        data = {}
+    original = data.get("original") if isinstance(data, dict) else None
+    if isinstance(original, str) and original:
+        return original
+    return claim.name[: -len(".processing")]
+
+
+# --------------------------------------------------------------- pid beacon
+
+def _pid_file(claimed: Path) -> Path:
+    return claimed.with_name(claimed.name + ".pid")
+
+
+def _read_pid_file(pid_file: Path) -> int | None:
+    try:
+        data = json.loads(pid_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    pid = data.get("pid") if isinstance(data, dict) else None
+    return pid if isinstance(pid, int) else None
+
+
+def _clear_pid_file(pid_file: Path) -> None:
+    try:
+        pid_file.unlink()
     except OSError:
         pass
 
 
-def recover_stale() -> None:
-    """Move .processing claims left by a DEAD run back for a retry.
+def _release_marker_fd(fd: int) -> None:
+    try:
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.lockf(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    try:
+        os.close(fd)
+    except OSError:
+        pass
 
-    Safe only under the single-instance lock: if another watcher were live,
-    its in-flight claim would look stale from here.
+
+# -------------------------------------------------------------------- lock
+
+def acquire_lock() -> bool:
+    """Allow only one watcher — decided by the OS, not by file contents.
+
+    A second watcher is the one thing claim recovery cannot survive: its
+    sweep would move a recording the first watcher is actively processing
+    into failed/. So while the byte lock on watch.lock is held by a live
+    watcher, a new copy refuses to start. The lock is taken atomically by
+    the OS: two copies started at the same instant cannot both win, and the
+    previous watcher's leftover file (crash, reboot) never blocks anyone —
+    its pid/started note is kept only so the refusal can name the holder.
     """
-    for stale in INBOX.glob("*.processing"):
-        original = stale.name[: -len(".processing")]
-        os.rename(stale, _dest(FAILED, original))
-        log(f"RECOVERED stale claim from a crashed run -> failed/: {original}")
+    global _LOCK_STREAM
+    try:
+        fd = os.open(LOCK_FILE, os.O_RDWR | os.O_CREAT)
+    except OSError as exc:
+        print(f"Cannot open {LOCK_FILE.name}: {exc}", flush=True)
+        return False
+    try:
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)  # byte 0: file position is 0 here
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        note = _lock_note()
+        holder = f" (PID {note['pid']}, started {note['started']})" if note else ""
+        print(
+            f"A watcher is already running{holder}.\n"
+            "This second copy will NOT start — two watchers would fight over\n"
+            "the same recordings and could file one into failed\\ by mistake.\n"
+            "If that copy is actually gone (crash, reboot), the lock releases\n"
+            "by itself — start watch.cmd again in a moment.",
+            flush=True,
+        )
+        return False
+    _LOCK_STREAM = os.fdopen(fd, "w", encoding="utf-8")
+    _LOCK_STREAM.write(json.dumps({"pid": os.getpid(),
+                                   "started": datetime.now().isoformat(timespec="seconds")}))
+    _LOCK_STREAM.flush()
+    return True
 
+
+def _lock_note() -> dict:
+    """Best-effort read of the current holder's note (for the refusal message)."""
+    try:
+        note = json.loads(LOCK_FILE.read_text(encoding="utf-8"))
+        return note if isinstance(note, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def release_lock() -> None:
+    global _LOCK_STREAM
+    if _LOCK_STREAM is None:
+        return
+    f, _LOCK_STREAM = _LOCK_STREAM, None
+    try:
+        if os.name == "nt":
+            import msvcrt
+            f.seek(0)  # the lock was taken at position 0
+            msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+    try:
+        f.close()  # closing the handle IS the release; the file stays in place
+    except OSError:
+        pass
+
+
+# ------------------------------------------------------------------ claims
+
+def _completeness_note(out_dir: Path) -> str:
+    """Human-readable completeness note from asr_meta.json (best effort).
+
+    transcribe.py counts billed-but-empty segments in segments_empty. A
+    positive count means parts of the recording came back with no text, so
+    the transcript may be incomplete — that must reach watch.log, not die in
+    the child's captured output. Only true integers with 0 <= empty <= total
+    and a positive total are trusted; ANYTHING else (missing keys, floats,
+    bools, strings, infinity like 1e999, counts that make no sense) produces
+    a clear diagnostic instead of silence — never an exception, so the
+    watcher keeps running and the next recording still processes.
+    """
+    try:
+        meta = json.loads((out_dir / "asr_meta.json").read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return "  (asr_meta.json not found — cannot verify segment completeness)"
+    except (OSError, ValueError) as exc:
+        return f"  (asr_meta.json unreadable: {exc} — cannot verify segment completeness)"
+    if not isinstance(meta, dict):
+        return "  (asr_meta.json has an unexpected shape — cannot verify segment completeness)"
+    empty, total = meta.get("segments_empty"), meta.get("segments")
+    if (isinstance(empty, bool) or isinstance(total, bool)
+            or not isinstance(empty, int) or not isinstance(total, int)):
+        return "  (asr_meta.json has non-integer segment counts — cannot verify segment completeness)"
+    if total <= 0 or empty < 0 or empty > total:
+        return (f"  (asr_meta.json segment counts make no sense: empty={empty} "
+                f"of total={total} — cannot verify segment completeness)")
+    if empty > 0:
+        return (f"  WARNING: {empty} of {total} audio segment(s) transcribed empty —"
+                f" transcript may be missing parts; review {out_dir.name}")
+    return ""
+
+
+def process_one(path: Path) -> bool:
+    claim = _claim_path(path)
+    marker = _pid_file(claim)
+    # The note (carrying the ORIGINAL filename) is written BEFORE the rename:
+    # a crash can then never leave a claim whose original name is lost, and
+    # a failed note write refuses the claim instead of degrading recovery.
+    try:
+        marker.write_text(json.dumps({"pid": None, "original": path.name}),
+                          encoding="utf-8")
+    except OSError as exc:
+        log(f"SKIP {path.name}: cannot write the claim note ({exc}) — will retry.")
+        return False
+    try:
+        os.rename(path, claim)  # atomic claim: a second watcher won't see it
+    except OSError as exc:
+        log(f"SKIP {path.name}: still locked by the sync app ({exc})")
+        _clear_pid_file(marker)  # tidy the pre-written note
+        return False
+    meeting_day = datetime.fromtimestamp(claim.stat().st_mtime).date().isoformat()
+    out_dir = HERE / "output" / f"{path.stem}_{datetime.now():%Y%m%d-%H%M%S}"
+    log(f"PROCESS {path.name} (meeting date {meeting_day})")
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, str(HERE / "transcribe.py"), str(claim),
+             "--date", meeting_day, "--date-assumed", "--out", str(out_dir)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+    except OSError as exc:
+        log(f"FAILED {path.name}: cannot launch transcribe.py ({exc})")
+        os.rename(claim, _dest(FAILED, path.name))
+        _clear_pid_file(marker)
+        return False
+    # Ownership beacon: the CHILD takes the marker's byte lock as its first
+    # act (before it opens the recording) and holds it for its whole run.
+    # This watcher only tidies the note once the child is done (a hard kill
+    # on timeout skips the child's own cleanup).
+    timed_out = False
+    try:
+        out, err = proc.communicate(timeout=PROCESS_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        proc.kill()
+        proc.communicate()
+    if not timed_out and proc.returncode == 0:
+        os.rename(claim, _dest(PROCESSED, path.name))
+        # r7: the marker note (the ONLY record of the original filename) is
+        # tidied AFTER the audio move succeeds — an interruption at the move
+        # then leaves claim + note in the inbox, which recovery handles by
+        # name; clearing first could strand the audio under an opaque name.
+        _clear_pid_file(marker)
+        try:
+            note = _completeness_note(out_dir)
+        except Exception as exc:  # a note must never kill the watch loop
+            note = f"  (completeness check failed: {exc} — cannot verify segment completeness)"
+        log(f"DONE {path.name} -> {out_dir}{note}")
+        return True
+    if timed_out:
+        err = f"timeout after {PROCESS_TIMEOUT}s"
+    os.rename(claim, _dest(FAILED, path.name))
+    _clear_pid_file(marker)
+    log(f"FAILED {path.name}: {(err or '').strip()[-300:]}")
+    return False
+
+
+def sweep_claims() -> None:
+    """Move finished/detached .processing claims back for a retry.
+
+    Runs at startup AND on every poll, always under the single-instance
+    lock. Ownership of a claim is decided by ONE atomic thing: the byte
+    lock on its marker file. The transcribe child locks the marker before
+    it touches the recording; this sweep must win the same lock before it
+    may move the claim, so claiming and recovering cannot overlap — there
+    is no window between "checking" and "moving".
+
+    - Marker locked (a live transcription, e.g. a crashed watcher's orphan
+      child): leave the claim alone, announce it once, re-check every poll.
+    - Marker free or missing: nobody owns the recording. The sweep creates
+      the marker itself if needed, moves the claim to failed/ under its
+      ORIGINAL filename (from the marker note), releases the lock, then
+      tidies the marker. A child that arrives after the move finds no
+      recording and exits before transcribing anything.
+    Stray markers whose claim is already gone are tidied up.
+    """
+    for stray in INBOX.glob("*.processing.pid"):
+        claim = INBOX / stray.name[: -len(".pid")]
+        if not claim.exists():
+            _clear_pid_file(stray)
+            log(f"Removed a stray pid marker without a claim: {stray.name}")
+    for stale in INBOX.glob("*.processing"):
+        marker = _pid_file(stale)
+        try:
+            fd = os.open(marker, os.O_RDWR | os.O_CREAT)  # tombstone if absent
+        except OSError as exc:
+            log(f"SKIP {stale.name}: cannot open the marker ({exc}) — will retry.")
+            continue
+        locked = False
+        try:
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            locked = True
+        except OSError:
+            pass
+        if not locked:
+            os.close(fd)
+            if stale.name not in _ANNOUNCED_ALIVE:
+                _ANNOUNCED_ALIVE.add(stale.name)
+                owner_note = _read_pid_file(marker)  # best-effort; a live
+                # child's mandatory lock blocks this read — pid may be unknown
+                who = (f"PID {owner_note}" if owner_note is not None
+                       else "a live transcription")
+                log(f"CLAIM {stale.name}: {who} — still being transcribed "
+                    "(marker held). Leaving it until that finishes.")
+            continue
+        # We hold the marker lock: no child can claim this recording now, and
+        # the note is readable ONLY through this locked fd (r7: the display
+        # name must be read under the lock — a pre-lock read could fail and
+        # strand the recovery under the opaque claim name).
+        display = _original_name(stale, fd)
+        try:
+            os.rename(stale, _dest(FAILED, display))
+        except OSError as exc:
+            log(f"SKIP {display}: cannot move it right now ({exc}) — will retry.")
+            _release_marker_fd(fd)
+            continue
+        _release_marker_fd(fd)
+        _ANNOUNCED_ALIVE.discard(stale.name)
+        _clear_pid_file(marker)
+        log(f"RECOVERED claim -> failed/: {display}")
+
+
+# ------------------------------------------------------------------- loop
 
 def scan_once(tracked: dict) -> None:
     for p in sorted(INBOX.iterdir()):
@@ -196,11 +427,12 @@ def main() -> int:
     try:
         for d in (INBOX, PROCESSED, FAILED):
             d.mkdir(parents=True, exist_ok=True)
-        recover_stale()  # safe only because the lock guarantees we are alone
+        sweep_claims()  # safe only because the lock guarantees we are alone
         log(f"Watching {INBOX} (poll {POLL_SECS}s). Sync your phone recordings here. Ctrl+C stops.")
         tracked: dict[str, tuple] = {}
         while True:
             try:
+                sweep_claims()  # an orphaned claim is retried once its child is gone
                 scan_once(tracked)
                 time.sleep(POLL_SECS)
             except KeyboardInterrupt:

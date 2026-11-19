@@ -44,13 +44,13 @@ if not exist "transcriber\.env" (
     copy /y "transcriber\.env.example" "transcriber\.env" >nul
     echo [NEXT STEP] transcriber\.env was created for you — open it and paste
     echo     your two API keys. Get them:
-    echo       Zhipu BigModel (transcription): https://open.bigmodel.cn
-    echo       DeepSeek (summaries):           https://platform.deepseek.com
+    echo       Zhipu BigModel ^(transcription^): https://open.bigmodel.cn
+    echo       DeepSeek ^(summaries^):           https://platform.deepseek.com
 )
 if not exist "news\.env" (
     copy /y "news\.env.example" "news\.env" >nul
     echo [NEXT STEP] news\.env was created for you — open it and paste your
-    echo     DeepSeek key (optional; without it the briefing shows raw headlines).
+    echo     DeepSeek key ^(optional; without it the briefing shows raw headlines^).
 )
 echo.
 

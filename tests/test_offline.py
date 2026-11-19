@@ -13,11 +13,14 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
 import unittest
 import wave
+from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
@@ -135,10 +138,14 @@ class TestConversionIntegrity(unittest.TestCase):
             self.assertIn("incomplete conversion", str(ctx.exception))
 
 
-# ---------------------------------------------------------------- HIGH-2
+# ---------------------------------------------------------------- HIGH-2 (r2)
 class TestWatcherSingleInstance(unittest.TestCase):
-    """Review finding 2: a second watcher's startup sweep could move a
-    recording the first watcher was processing into failed/ (watch.py:84)."""
+    """Review r2 finding 2: two simultaneous starters could both take over a
+    stale lock (both read it as dead, then the loser's delete removed the
+    winner's FRESH lock). The lock is now an OS byte lock held for the
+    process lifetime: the OS decides atomically who holds it and releases it
+    by itself on exit or crash. These tests hold REAL byte locks from real
+    processes; lock-file CONTENTS are never load-bearing anymore."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -147,50 +154,87 @@ class TestWatcherSingleInstance(unittest.TestCase):
         watch.LOCK_FILE = self.dir / "watch.lock"
 
     def tearDown(self):
+        watch.release_lock()
         watch.LOCK_FILE = self.old_lock
         self.tmp.cleanup()
 
-    def _write_lock(self, pid: int) -> None:
-        watch.LOCK_FILE.write_text(
-            json.dumps({"pid": pid, "started": "2026-11-17T10:00:00"}), encoding="utf-8")
+    def _holder(self):
+        """A real second process holding the watch.lock byte for 60 s."""
+        return subprocess.Popen([sys.executable, "-c",
+            "import os, sys, time\n"
+            "f = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT)\n"
+            "if os.name == 'nt':\n"
+            "    import msvcrt; msvcrt.locking(f, msvcrt.LK_NBLCK, 1)\n"
+            "else:\n"
+            "    import fcntl; fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+            "print('HELD', flush=True)\n"
+            "time.sleep(60)\n", str(watch.LOCK_FILE)],
+            stdout=subprocess.PIPE, text=True)
 
-    def test_neg_second_watcher_refused_while_first_alive(self):
-        # Live PID = a real sleeping process we spawned.
-        sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
-        try:
-            self._write_lock(sleeper.pid)
+    def _try_acquire_until_refused(self) -> bool:
+        """acquire_lock() must fail once the holder really holds the byte.
+
+        The holder needs a moment to start; an early success just means the
+        byte was still free — release and retry."""
+        import time as _time
+        deadline = _time.time() + 10
+        while _time.time() < deadline:
             with mock.patch.object(watch, "log"):
-                self.assertFalse(watch.acquire_lock(),
-                                 "a second watcher must refuse to start")
-            self.assertTrue(watch.LOCK_FILE.exists(), "the live lock must survive refusal")
-        finally:
-            sleeper.kill()
-            sleeper.wait()
+                if not watch.acquire_lock():
+                    return True
+            watch.release_lock()
+            _time.sleep(0.1)
+        return False
 
-    def test_pos_stale_lock_taken_over(self):
-        # Just-outside edge: PID whose process has already exited.
+    def test_neg_second_watcher_refused_while_byte_held(self):
+        holder = self._holder()
+        try:
+            self.assertEqual(holder.stdout.readline().strip(), "HELD")
+            self.assertTrue(self._try_acquire_until_refused(),
+                            "a second watcher must refuse while the byte is held")
+            self.assertTrue(watch.LOCK_FILE.exists(), "the lock must survive the refusal")
+        finally:
+            holder.kill()
+            holder.wait()
+        # crash-release: the OS frees the byte the moment the holder dies —
+        # this is what replaces r1's stale-lock takeover (and its race).
+        with mock.patch.object(watch, "log"):
+            self.assertTrue(watch.acquire_lock(),
+                            "a replacement must acquire after the holder exits")
+        watch.release_lock()
+        # r3 plan conformance: the lock FILE stays in place — deleting it is
+        # racy on Unix (a replacement could lock the old file while a third
+        # process creates and locks a fresh one). Release = close the handle;
+        # the file is only a note for the refusal message.
+        self.assertTrue(watch.LOCK_FILE.exists(),
+                        "release must close the handle, not delete the lock file")
+
+    def test_pos_leftover_lock_file_never_blocks(self):
+        # Edge: a leftover file with a DEAD pid note (crashed watcher). Under
+        # r1 this needed PID-liveness "takeover" — the code that raced. Now
+        # the file is just a note; a free byte means free to start.
         dead = subprocess.Popen([sys.executable, "-c", "pass"])
         dead.wait()
-        self._write_lock(dead.pid)
+        watch.LOCK_FILE.write_text(
+            json.dumps({"pid": dead.pid, "started": "2026-11-18T00:00:00"}), encoding="utf-8")
         with mock.patch.object(watch, "log"):
-            self.assertTrue(watch.acquire_lock(), "a dead holder's lock must be taken over")
+            self.assertTrue(watch.acquire_lock())
         watch.release_lock()
-        self.assertFalse(watch.LOCK_FILE.exists())
 
-    def test_pos_corrupt_lock_is_treated_as_stale(self):
+    def test_pos_corrupt_lock_file_never_blocks(self):
         # Birth shape: a half-written lock from a crash mid-write.
         watch.LOCK_FILE.write_text("{broken json", encoding="utf-8")
         with mock.patch.object(watch, "log"):
             self.assertTrue(watch.acquire_lock())
         watch.release_lock()
 
-    def test_neg_recover_stale_documented_as_lock_guarded(self):
-        # The defect mechanism, kept explicit: recover_stale() must stay
+    def test_neg_sweep_documented_as_lock_guarded(self):
+        # The defect mechanism, kept explicit: the claim sweep must stay
         # unreachable while a lock is held — main() wires acquire before it.
         import inspect
         src = inspect.getsource(watch.main)
-        self.assertLess(src.index("acquire_lock"), src.index("recover_stale"),
-                        "recover_stale() must only run after the lock is held")
+        self.assertLess(src.index("acquire_lock"), src.index("sweep_claims"),
+                        "sweep_claims() must only run after the lock is held")
 
 
 # ---------------------------------------------------------------- MED-3
@@ -492,6 +536,585 @@ class TestMeetingDateVisibility(unittest.TestCase):
             summary = (out / "summary.md").read_text(encoding="utf-8")
             self.assertIn("--date YYYY-MM-DD", summary,
                           "the today-default must say how to correct it")
+
+
+# ---------------------------------------------------------------- C2 (r2/r4)
+def _lock_byte(fd: int) -> None:
+    """Take the byte-0 lock non-blocking; raise OSError if held elsewhere."""
+    if os.name == "nt":
+        import msvcrt
+        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+    else:
+        import fcntl
+        fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _unlock_byte(fd: int) -> None:
+    if os.name == "nt":
+        import msvcrt
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+        fcntl.lockf(fd, fcntl.LOCK_UN)
+
+
+@contextmanager
+def hold_marker_lock(path: Path):
+    """Hold a file's byte-0 lock from this process (like a live child)."""
+    fd = os.open(path, os.O_RDWR | os.O_CREAT)
+    _lock_byte(fd)
+    try:
+        yield fd
+    finally:
+        try:
+            _unlock_byte(fd)
+        except OSError:
+            pass
+        os.close(fd)
+
+
+class TestClaimSweep(unittest.TestCase):
+    """Review r2 condition 2 / r4 finding: claiming and recovering the same
+    recording are mutually exclusive — the marker's byte lock decides. The
+    child locks the marker before touching the recording; the sweep must win
+    the same lock before moving the claim. There is no check-then-move
+    window left to lose a race in."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.inbox = self.root / "inbox"
+        self.failed = self.root / "failed"
+        self.inbox.mkdir()
+        self.failed.mkdir()  # production main() creates these before any sweep
+        self.old_inbox, self.old_failed = watch.INBOX, watch.FAILED
+        watch.INBOX, watch.FAILED = self.inbox, self.failed
+        self.old_announced = set(watch._ANNOUNCED_ALIVE)
+        watch._ANNOUNCED_ALIVE.clear()
+        self.holders = []
+
+    def tearDown(self):
+        for h in self.holders:
+            h.kill()
+            h.wait()
+        watch.INBOX, watch.FAILED = self.old_inbox, self.old_failed
+        watch._ANNOUNCED_ALIVE.clear()
+        watch._ANNOUNCED_ALIVE.update(self.old_announced)
+        self.tmp.cleanup()
+
+    def _lock_holder(self, marker: Path):
+        """A real second process holding the marker's byte-0 lock for 60 s."""
+        h = subprocess.Popen([sys.executable, "-c",
+            "import os, sys, time\n"
+            "f = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT)\n"
+            "if os.name == 'nt':\n"
+            "    import msvcrt; msvcrt.locking(f, msvcrt.LK_NBLCK, 1)\n"
+            "else:\n"
+            "    import fcntl; fcntl.lockf(f, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+            "print('HELD', flush=True)\n"
+            "time.sleep(60)\n", str(marker)],
+            stdout=subprocess.PIPE, text=True)
+        self.holders.append(h)
+        return h
+
+    def test_neg_locked_marker_claim_left_alone(self):
+        # The r4 defect class, forced: the marker's PID note is DEAD (that
+        # alone made the pre-r4 sweep move the claim) but a LIVE transcription
+        # holds the marker lock — the lock is the decision, not the PID.
+        claim = self.inbox / "meet.m4a.processing"
+        claim.write_text("audio", encoding="utf-8")
+        marker = watch._pid_file(claim)
+        marker.write_text("999999", encoding="utf-8")
+        holder = self._lock_holder(marker)
+        self.assertEqual(holder.stdout.readline().strip(), "HELD")
+        with mock.patch.object(watch, "log"):
+            watch.sweep_claims()
+        self.assertTrue(claim.exists(), "a locked marker means the claim is owned")
+        self.assertTrue(marker.exists(), "the owner's marker must survive")
+        self.assertEqual(list(self.failed.iterdir()), [])
+
+    def test_pos_unlocked_marker_recovered(self):
+        # Just-outside edge: marker present with a dead PID note, NO lock —
+        # nobody owns the recording; the sweep wins the lock and moves it.
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        claim = self.inbox / "meet.m4a.processing"
+        claim.write_text("audio", encoding="utf-8")
+        watch._pid_file(claim).write_text(str(dead.pid), encoding="utf-8")
+        with mock.patch.object(watch, "log"):
+            watch.sweep_claims()
+        self.assertFalse(claim.exists())
+        self.assertTrue((self.failed / "meet.m4a").exists())
+        self.assertFalse(watch._pid_file(claim).exists(), "the marker is tidied with the claim")
+
+    def test_pos_ownerless_claim_recovered_and_tombstone_cleaned(self):
+        # Birth shape: a claim with no marker at all (crash before the child
+        # claimed it). The sweep tombstones the marker itself, moves the
+        # claim, and leaves no marker behind.
+        claim = self.inbox / "meet.m4a.processing"
+        claim.write_text("audio", encoding="utf-8")
+        with mock.patch.object(watch, "log"):
+            watch.sweep_claims()
+        self.assertTrue((self.failed / "meet.m4a").exists())
+        self.assertFalse(watch._pid_file(claim).exists(), "the tombstone is tidied")
+
+    def test_pos_stray_marker_tidied(self):
+        # r3: a marker whose claim is gone (the child lost the publication
+        # race) has nobody left to protect — the sweep tidies it.
+        marker = self.inbox / "gone.m4a.processing.pid"
+        marker.write_text("12345", encoding="utf-8")
+        with mock.patch.object(watch, "log"):
+            watch.sweep_claims()
+        self.assertFalse(marker.exists())
+        self.assertEqual(list(self.failed.iterdir()), [])
+
+    def test_pos_recovery_uses_the_original_from_the_note(self):
+        # r6 P3: an opaque claim recovers under its ORIGINAL filename — even
+        # a 220-character one (which could never fit a tagged claim name).
+        long_name = "r" * 220 + ".m4a"
+        claim = self.inbox / "proc-abc123def456.processing"
+        claim.write_text("audio", encoding="utf-8")
+        marker = watch._pid_file(claim)
+        marker.write_text(json.dumps({"pid": None, "original": long_name}),
+                          encoding="utf-8")
+        self.assertLessEqual(len(marker.name), 255)
+        with mock.patch.object(watch, "log"):
+            watch.sweep_claims()
+        self.assertFalse(claim.exists())
+        self.assertTrue((self.failed / long_name).exists(),
+                        "recovery must restore the ORIGINAL filename from the note")
+        self.assertFalse(marker.exists())
+
+
+# ---------------------------------------------------------------- r6
+class TestClaimNaming(unittest.TestCase):
+    """Review r6 findings: the claim id must NOT depend on the clock (a
+    repeated clock reading — NTP step, coarse tick — re-attached a delayed
+    child to a newer recording), and the working-file names must stay short
+    no matter how long the recording's name is (the lock marker must fit
+    Windows' 255-character filename limit)."""
+
+    def test_claim_unique_under_a_frozen_clock(self):
+        # Freeze the clock completely: claims made "at the same reading"
+        # must still differ — the id is secrets-based, not time-based.
+        frozen = mock.MagicMock()
+        frozen.now.return_value = datetime(2026, 11, 19, 8, 0, 0)
+        with mock.patch.object(watch, "datetime", frozen):
+            names = {watch._claim_path(Path("meeting.m4a")).name
+                     for _ in range(200)}
+        self.assertEqual(len(names), 200,
+                         "claims must be unique even when the clock never moves")
+
+    def test_claim_name_carries_no_original_and_fits_any_recording(self):
+        long_name = "r" * 220 + ".m4a"
+        claim = watch._claim_path(Path(long_name))
+        self.assertNotIn("meeting", watch._claim_path(Path("meeting.m4a")).name,
+                         "the working name must be an opaque id, not the recording")
+        self.assertLessEqual(len(watch._pid_file(claim).name), 255,
+                             "the lock marker must fit Windows' filename limit")
+
+    def test_original_name_from_marker_and_legacy_fallback(self):
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            claim = Path("proc-abc123def456.processing")
+            marker = d / "proc-abc123def456.processing.pid"
+            marker.write_text(json.dumps({"pid": 7, "original": "board-meeting.m4a"}),
+                              encoding="utf-8")
+            fd = os.open(marker, os.O_RDWR)
+            try:
+                self.assertEqual(watch._original_name(claim, fd), "board-meeting.m4a",
+                                 "the name must be readable through the LOCKED fd")
+            finally:
+                os.close(fd)
+            # legacy shape: no note, the claim name carried the original
+            legacy = Path("board-meeting.m4a.processing")
+            fd_absent = os.open(d / "absent.pid", os.O_RDWR | os.O_CREAT)
+            try:
+                self.assertEqual(watch._original_name(legacy, fd_absent),
+                                 "board-meeting.m4a")
+            finally:
+                os.close(fd_absent)
+                (d / "absent.pid").unlink()
+            # unreadable note: fallback, never an exception
+            marker.write_text("{broken", encoding="utf-8")
+            fd_broken = os.open(marker, os.O_RDWR)
+            try:
+                self.assertEqual(watch._original_name(claim, fd_broken),
+                                 claim.name[: -len(".processing")])
+            finally:
+                os.close(fd_broken)
+
+
+# ---------------------------------------------------------------- r5/r6
+class TestDelayedChildCantPickUpReplacement(unittest.TestCase):
+    """Review r5/r6 finding, offline form: two attempts of the SAME filename
+    never share a claim path, each attempt's path is gone once it finishes
+    (renamed away — re-attachment impossible), the original filename travels
+    in the marker note, and each child's result is its own recording's bytes.
+    (RED on dd98d4e at harness level: two calls on one shared path.)"""
+
+    def test_two_attempts_never_share_a_claim_or_bytes(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        inbox, processed, failed = root / "inbox", root / "processed", root / "failed"
+        for d in (inbox, processed, failed):
+            d.mkdir()  # production main() creates these before any processing
+        old = {"HERE": watch.HERE, "INBOX": watch.INBOX,
+               "PROCESSED": watch.PROCESSED, "FAILED": watch.FAILED}
+        watch.HERE, watch.INBOX = root, inbox
+        watch.PROCESSED, watch.FAILED = processed, failed
+        seen = {"argvs": [], "notes": [], "bytes": []}
+
+        class _FakeProc:
+            pid = 424242
+            returncode = 0
+
+            def __init__(self, cmd):
+                self.cmd = cmd
+
+            def communicate(self, timeout=None):
+                claimed = Path(self.cmd[2])
+                seen["argvs"].append(str(claimed))
+                try:
+                    seen["notes"].append(
+                        json.loads(Path(str(claimed) + ".pid").read_text(encoding="utf-8")))
+                except (OSError, ValueError):
+                    seen["notes"].append(None)
+                seen["bytes"].append(claimed.read_bytes())  # the child's recording
+                return ("", "")
+
+            def kill(self):
+                pass
+
+        try:
+            source = inbox / "meeting.m4a"
+            source.write_bytes(b"A-ORIGINAL")
+            with mock.patch.object(watch, "log"), \
+                 mock.patch.object(watch.subprocess, "Popen",
+                                   side_effect=lambda cmd, **k: _FakeProc(cmd)):
+                self.assertTrue(watch.process_one(source))
+                argv_a = seen["argvs"][0]
+                self.assertNotIn("meeting", argv_a,
+                                 "the working name must be an opaque id")
+                self.assertEqual(seen["notes"][0],
+                                 {"pid": None, "original": "meeting.m4a"},
+                                 "the ORIGINAL filename must ride in the marker note")
+                self.assertEqual(seen["bytes"][0], b"A-ORIGINAL")
+                self.assertFalse(Path(argv_a).exists(),
+                                 "a finished attempt's claim path is gone — nothing to re-attach")
+
+                source.write_bytes(b"B-CONTENTS")
+                self.assertTrue(watch.process_one(source))
+            argv_b = seen["argvs"][1]
+            self.assertNotEqual(argv_b, argv_a,
+                                "two attempts of one filename must never share a claim")
+            self.assertEqual(seen["bytes"][1], b"B-CONTENTS")
+            processed_files = sorted(p.read_bytes() for p in processed.iterdir())
+            self.assertEqual(processed_files, [b"A-ORIGINAL", b"B-CONTENTS"],
+                             "each result must be its own recording's bytes")
+        finally:
+            watch.HERE, watch.INBOX = old["HERE"], old["INBOX"]
+            watch.PROCESSED, watch.FAILED = old["PROCESSED"], old["FAILED"]
+
+
+# ------------------------------------------------- r3/r4: ownership first
+class TestTranscribeClaimBeacon(unittest.TestCase):
+    """Review r3 finding 1 + r4 finding: the child must take the marker's
+    byte lock BEFORE it can use the recording, and must refuse to start if
+    the marker cannot be opened, locked, or written. The lock is what makes
+    claiming mutually exclusive with recovery. (In-process: real files.)"""
+
+    def _valid_summary_data(self):
+        return {"summary": "s", "project": None, "priorities": [], "events": [],
+                "insights": {"outcome": "unclear", "objections": [], "recommendations": []}}
+
+    def _fake_asr(self, seen: dict):
+        def fake(path, **k):
+            marker = Path(str(path) + ".pid")
+            seen["marker_at_call"] = marker.exists()
+            seen["locked_at_call"] = None
+            if marker.exists():
+                try:
+                    fd = os.open(marker, os.O_RDWR)
+                except OSError:
+                    seen["locked_at_call"] = None
+                else:
+                    try:
+                        try:
+                            _lock_byte(fd)
+                            seen["locked_at_call"] = False  # we got it: child did NOT
+                            _unlock_byte(fd)
+                        except OSError:
+                            seen["locked_at_call"] = True   # child holds it
+                    finally:
+                        os.close(fd)
+            return {"transcript": "hello", "duration_s": 2.0, "segments": 1,
+                    "segments_empty": 0, "cost_yuan_est": 0.01, "model": "m"}
+        return fake
+
+    def _run(self, argv_extra):
+        seen = {}
+        out = self.inbox / "out"
+        with mock.patch.object(sys, "argv",
+                               ["transcribe.py", *argv_extra, "--out", str(out)]), \
+             mock.patch.object(transcribe.asr_lib, "transcribe",
+                               side_effect=self._fake_asr(seen)), \
+             mock.patch.object(transcribe.summarize, "summarize",
+                               return_value=self._valid_summary_data()):
+            rc = transcribe.main()
+        return rc, seen
+
+    def setUp(self):
+        # ignore_cleanup_errors: the in-process child holds its marker lock
+        # until the test PROCESS exits (by design — the OS releases it), so
+        # Windows cannot delete the locked marker at cleanup time.
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.inbox = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_marker_locked_before_first_use(self):
+        # Order 1 (transcription claims first): by the time asr can read the
+        # recording, the child already holds the marker lock — recovery at
+        # that instant must lose the lock and leave the claim alone.
+        claim = self.inbox / "meet.m4a.processing"
+        claim.write_text("audio", encoding="utf-8")
+        rc, seen = self._run([str(claim), "--date", "2026-11-18"])
+        self.assertEqual(rc, 0)
+        self.assertTrue(seen["marker_at_call"])
+        self.assertTrue(seen["locked_at_call"],
+                        "the marker must be LOCKED before asr reads the recording")
+
+    def test_refuses_to_run_when_marker_locked_by_other(self):
+        # Order 2 (recovery wins): the sweep holds the marker lock — the
+        # child must exit BEFORE transcription, never reading the recording.
+        claim = self.inbox / "meet.m4a.processing"
+        claim.write_text("audio", encoding="utf-8")
+        with hold_marker_lock(self.inbox / "meet.m4a.processing.pid"):
+            rc, seen = self._run([str(claim), "--date", "2026-11-18"])
+        self.assertEqual(rc, 1, "a recovering claim must not be transcribed")
+        self.assertIsNone(seen.get("marker_at_call"), "the recording must never be read")
+
+    def test_recovery_wins_child_exits_before_transcription(self):
+        # The full order-2 flow: recovery moves the unowned claim first; a
+        # child started afterwards finds no recording and exits — with the
+        # marker it created tidied by the next sweep.
+        claim = self.inbox / "meet.m4a.processing"
+        claim.write_text("audio", encoding="utf-8")
+        failed = self.inbox / "failed"
+        failed.mkdir()  # production main() creates these before any sweep
+        with mock.patch.object(watch, "log"), \
+             mock.patch.object(watch, "INBOX", self.inbox), \
+             mock.patch.object(watch, "FAILED", failed):
+            watch.sweep_claims()
+        self.assertTrue((failed / "meet.m4a").exists(),
+                        "recovery moved the unowned claim")
+        rc, seen = self._run([str(claim), "--date", "2026-11-18"])
+        self.assertEqual(rc, 1, "no recording = nothing to transcribe")
+        self.assertIsNone(seen.get("marker_at_call"), "the recording must never be read")
+        os.close(transcribe._CLAIM_MARKER_FD)  # simulate the child process exiting
+        with mock.patch.object(watch, "log"), \
+             mock.patch.object(watch, "INBOX", self.inbox), \
+             mock.patch.object(watch, "FAILED", failed):
+            watch.sweep_claims()
+        self.assertEqual(list(self.inbox.glob("*.pid")), [],
+                         "the child's leftover marker is tidied by the next sweep")
+
+    def test_refuses_to_run_when_marker_unwritable(self):
+        claim = self.inbox / "meet.m4a.processing"
+        claim.write_text("audio", encoding="utf-8")
+        (self.inbox / "meet.m4a.processing.pid").mkdir()  # marker path = a directory
+        rc, seen = self._run([str(claim), "--date", "2026-11-18"])
+        self.assertEqual(rc, 1, "an unrecognizable transcription must refuse to start")
+        self.assertIsNone(seen.get("marker_at_call"), "the recording must never be read")
+
+    def test_no_marker_for_standalone_file(self):
+        audio = self.inbox / "plain.wav"
+        audio.write_text("audio", encoding="utf-8")
+        rc, seen = self._run([str(audio), "--date", "2026-11-18"])
+        self.assertEqual(rc, 0)
+        self.assertFalse(seen["marker_at_call"])
+        self.assertEqual(list(self.inbox.glob("*.pid")), [],
+                         "standalone runs never write markers")
+
+    def _display_check(self, original: str):
+        claim = self.inbox / "proc-abc123def456.processing"
+        claim.write_text("audio", encoding="utf-8")
+        marker = self.inbox / "proc-abc123def456.processing.pid"
+        marker.write_text(json.dumps({"pid": None, "original": original}),
+                          encoding="utf-8")
+        rc, seen = self._run([str(claim), "--date", "2026-11-18"])
+        self.assertEqual(rc, 0)
+        meta = json.loads((self.inbox / "out" / "asr_meta.json").read_text(encoding="utf-8"))
+        self.assertEqual(meta["audio"], original,
+                         "display must use the ORIGINAL from the marker note")
+        self.assertEqual(meta["meeting_day"], "2026-11-18")
+        # r7 window 1: the child is READ-ONLY on the note — a truncate/merge
+        # here would crash-strand an empty note (recovery would lose the
+        # original name). Close the child's held fd first (same trick as
+        # process exit — the mandatory lock blocks other handles until then).
+        os.close(transcribe._CLAIM_MARKER_FD)
+        transcribe._CLAIM_MARKER_FD = None
+        note = json.loads(marker.read_text(encoding="utf-8"))
+        self.assertEqual(note["original"], original,
+                         "the note must survive the child UNTOUCHED")
+        self.assertIsNone(note["pid"],
+                         "the child must not rewrite the note (r7 window 1)")
+
+    def test_display_uses_the_original_from_the_marker_note(self):
+        self._display_check("Q3 board meeting.m4a")
+
+    def test_long_original_name_surfaces_intact(self):
+        # r6 P3: a 220-character original must survive display untouched —
+        # it never enters the working-file names at all.
+        self._display_check("r" * 220 + ".m4a")
+
+    def test_legacy_claim_display_falls_back_to_claim_name(self):
+        # A legacy claim (<name>.processing, no note) still displays right.
+        claim = self.inbox / "legacy-meeting.m4a.processing"
+        claim.write_text("audio", encoding="utf-8")
+        rc, seen = self._run([str(claim), "--date", "2026-11-18"])
+        self.assertEqual(rc, 0)
+        meta = json.loads((self.inbox / "out" / "asr_meta.json").read_text(encoding="utf-8"))
+        self.assertEqual(meta["audio"], "legacy-meeting.m4a")
+
+
+# ---------------------------------------------------------------- C3 (r2)
+class TestCompletenessNote(unittest.TestCase):
+    """Review r2 finding 3 / condition 3: the empty-segment warning must be
+    durable — read structurally from asr_meta.json, never swallowed with the
+    child's captured output, and unreadable metadata must say so."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.out = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _meta(self, **kw):
+        (self.out / "asr_meta.json").write_text(json.dumps(kw), encoding="utf-8")
+
+    def _meta_raw(self, text: str):
+        (self.out / "asr_meta.json").write_text(text, encoding="utf-8")
+
+    def test_warning_on_empty_segments(self):
+        self._meta(segments=5, segments_empty=2)
+        note = watch._completeness_note(self.out)
+        self.assertIn("WARNING", note)
+        self.assertIn("2 of 5", note)
+
+    def test_plain_done_when_zero_empty(self):
+        self._meta(segments=5, segments_empty=0)
+        self.assertEqual(watch._completeness_note(self.out), "")
+
+    def test_missing_meta_names_itself(self):
+        self.assertIn("not found", watch._completeness_note(self.out))
+        self.assertIn("cannot verify", watch._completeness_note(self.out))
+
+    def test_malformed_meta_names_itself(self):
+        self._meta_raw("{not json")
+        self.assertIn("cannot verify", watch._completeness_note(self.out))
+
+    def test_non_dict_meta_names_itself(self):
+        self._meta_raw("[1, 2]")
+        self.assertIn("unexpected shape", watch._completeness_note(self.out))
+
+    # r3 finding 2: only true integers with 0 <= empty <= total, total > 0
+    # are trusted. Everything else must be a diagnostic — never a silent
+    # plain DONE, never an exception that kills the watch loop.
+    def test_empty_dict_is_not_silently_complete(self):
+        # r3 probe: {} yielded a plain DONE — missing counts cannot be trusted.
+        self._meta_raw("{}")
+        self.assertIn("cannot verify", watch._completeness_note(self.out))
+
+    def test_fractional_count_rejected(self):
+        self._meta(segments=5, segments_empty=1.5)
+        self.assertIn("cannot verify", watch._completeness_note(self.out))
+
+    def test_infinity_does_not_raise(self):
+        # r3 probe: 1e999 parsed to float infinity and int(inf) raised
+        # OverflowError AFTER the audio was already archived — killing the
+        # watch loop. Must be a diagnostic instead.
+        self._meta_raw('{"segments": 5, "segments_empty": 1e999}')
+        self.assertIn("cannot verify", watch._completeness_note(self.out))
+
+    def test_bool_count_rejected(self):
+        # bool is an int subclass; true must not silently count as 1.
+        self._meta(segments=5, segments_empty=True)
+        self.assertIn("cannot verify", watch._completeness_note(self.out))
+
+    def test_string_count_rejected(self):
+        self._meta(segments=5, segments_empty="2")
+        self.assertIn("cannot verify", watch._completeness_note(self.out))
+
+    def test_negative_empty_rejected(self):
+        self._meta(segments=5, segments_empty=-1)
+        self.assertIn("cannot verify", watch._completeness_note(self.out))
+
+    def test_empty_greater_than_total_rejected(self):
+        self._meta(segments=2, segments_empty=3)
+        self.assertIn("cannot verify", watch._completeness_note(self.out))
+
+    def test_zero_total_rejected(self):
+        self._meta(segments=0, segments_empty=0)
+        self.assertIn("cannot verify", watch._completeness_note(self.out))
+
+
+# ---------------------------------------------------------------- r2 finding 1
+class TestCmdFilesNoLiveParensInBlocks(unittest.TestCase):
+    """Review r2 finding 1 (class-level guard): inside a parenthesized cmd
+    block, an unescaped ( or ) in an echo line closes the block early —
+    setup.cmd:47/48/53 aborted first-time setup with 'was unexpected'.
+    Escaped ^(^) is required inside blocks; top-level echoes may keep parens."""
+
+    @staticmethod
+    def _live(text: str) -> str:
+        """Strip cmd escapes: ^x is literal x, never structural."""
+        out, i = [], 0
+        while i < len(text):
+            if text[i] == "^" and i + 1 < len(text):
+                i += 2
+                continue
+            out.append(text[i])
+            i += 1
+        return "".join(out)
+
+    @classmethod
+    def _violations(cls, text: str):
+        bad, depth = [], 0
+        for no, line in enumerate(text.splitlines(), 1):
+            live = cls._live(line)
+            if depth > 0 and re.match(r"\s*echo\b", line, re.I):
+                if "(" in live or ")" in live:
+                    bad.append((no, line.strip()))
+                    continue  # file is already broken; depth no longer trusted
+            depth += live.count("(") - live.count(")")
+            depth = max(depth, 0)
+        return bad
+
+    def _cmd_files(self):
+        return sorted(set(ROOT.rglob("*.cmd")))
+
+    def test_all_cmd_files_have_no_live_parens_inside_blocks(self):
+        problems = []
+        for f in self._cmd_files():
+            for no, line in self._violations(f.read_text(encoding="utf-8")):
+                problems.append(f"{f.name}:{no}: {line}")
+        self.assertEqual(problems, [], "unescaped parens in echo inside cmd blocks")
+
+    def test_neg_checker_catches_synthetic_violation(self):
+        # Negative control for the checker itself: the exact broken shape.
+        bad = "@echo off\nif not exist x (\n    echo key (optional; note).\n)\necho after\n"
+        found = self._violations(bad)
+        self.assertEqual(len(found), 1, "the checker must flag the broken shape")
+        self.assertIn("(optional", found[0][1])
+
+    def test_checker_accepts_escaped_shape(self):
+        good = "@echo off\nif not exist x (\n    echo key ^(optional; note^).\n)\necho after\n"
+        self.assertEqual(self._violations(good), [])
 
 
 if __name__ == "__main__":

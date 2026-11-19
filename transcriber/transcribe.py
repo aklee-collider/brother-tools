@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import sys
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -171,6 +172,16 @@ def write_summary(data: dict, asr: dict, path: Path, title: str,
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+_CLAIM_MARKER_FD: int | None = None
+
+
+def _legacy_display(claim_name: str) -> str:
+    """Display fallback for claims that predate the marker note: the original
+    filename was the claim name itself (<name>.processing)."""
+    return (claim_name[:-len(".processing")]
+            if claim_name.endswith(".processing") else claim_name)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Transcribe a meeting recording and extract priorities, calendar events, and communication insights.")
     ap.add_argument("audio", nargs="?", help="audio file (wav/mp3/m4a/ogg/opus); omit when using --resume")
@@ -230,6 +241,53 @@ def main() -> int:
         if not args.audio:
             ap.error("an audio file is required (or use --resume OUT_DIR)")
         audio = Path(args.audio)
+        # Ownership-first (watcher runs only): claim the recording by taking
+        # the byte lock on its marker BEFORE touching it. Recovery must win
+        # the same lock before moving the claim, so the OS decides who owns
+        # the recording — there is no window between our claim and our first
+        # read. If the marker cannot be opened or locked, we refuse to
+        # start: an unrecognizable transcription must not consume the
+        # recording. The lock (and fd) stay held for the whole run; the OS
+        # releases them when this process exits or crashes.
+        display: str | None = None
+        if audio.name.endswith(".processing"):
+            global _CLAIM_MARKER_FD
+            marker = audio.with_name(audio.name + ".pid")
+            try:
+                fd = os.open(marker, os.O_RDWR | os.O_CREAT)
+            except OSError as exc:
+                print(f"ERROR: cannot open the processing marker {marker.name}: {exc} "
+                      f"— refusing to start so the recording stays safe.", file=sys.stderr)
+                return 1
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                os.close(fd)
+                print("ERROR: the processing marker is locked — a watcher is recovering "
+                      "this recording. Not starting.", file=sys.stderr)
+                return 1
+            # READ-ONLY on the marker: the watcher wrote the note (with the
+            # ORIGINAL filename) in one single write before the rename, and a
+            # rewrite from here could crash mid-way and break the note that
+            # recovery depends on (r7: truncate-then-write left an empty-note
+            # window; write-then-truncate left unparseable tails). Display is
+            # read through our OWN locked fd (a second handle would be blocked
+            # by the mandatory lock); if unreadable, fall back to the claim
+            # name for display only — the note stays untouched for recovery.
+            try:
+                os.lseek(fd, 0, 0)
+                note = json.loads(os.read(fd, 65536).decode("utf-8", errors="replace"))
+                original = note.get("original") if isinstance(note, dict) else None
+                if isinstance(original, str) and original:
+                    display = original
+            except (OSError, ValueError):
+                pass
+            _CLAIM_MARKER_FD = fd  # held until process exit; kept for diagnostics/tests
         if not audio.exists():
             print(f"ERROR: file not found: {audio}", file=sys.stderr)
             return 1
@@ -241,7 +299,7 @@ def main() -> int:
             date_note = ""
         else:
             date_note = ("today — if the meeting was earlier, re-run with --date YYYY-MM-DD")
-        title = audio.stem
+        title = Path(display if display else _legacy_display(audio.name)).stem
 
         out_dir = Path(args.out) if args.out else HERE / "output" / f"{audio.stem}_{datetime.now():%Y%m%d-%H%M%S}"
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -255,7 +313,7 @@ def main() -> int:
         (out_dir / "transcript.txt").write_text(asr["transcript"], encoding="utf-8")
         (out_dir / "asr_meta.json").write_text(json.dumps({
             "title": title,
-            "audio": audio.name,
+            "audio": display if display else _legacy_display(audio.name),
             "meeting_day": meeting_day,
             "date_note": date_note,
             "duration_s": asr["duration_s"],
@@ -297,7 +355,6 @@ def main() -> int:
     print(f"Done: {out_dir}")
     if args.open:
         try:
-            import os
             os.startfile(out_dir)  # Windows
         except Exception:
             pass

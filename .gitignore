@@ -8,6 +8,7 @@ __pycache__/
 # Generated output and personal recordings
 transcriber/output/
 transcriber/inbox/
+transcriber/watch.lock
 news/digest.json
 news/index.html
 
